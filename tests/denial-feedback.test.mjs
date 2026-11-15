@@ -16,7 +16,7 @@ import { createHarness, reasoningChunks, textChunks } from './harness/harness.mj
 
 const plugin = await loadPlugin()
 
-/** Create one harness with a fixed reviewer script and approval policy. */
+/** Create one harness with a fixed reviewer script and approval mode. */
 function harnessFor(options) {
   return createHarness({
     plugin,

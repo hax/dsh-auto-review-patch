@@ -2,8 +2,8 @@
  * LLM-backed authorization gate for the current-session-only Auto permission
  * preset. Every native call and every started PTC inner call is reviewed once
  * before its body; the outer `run_code` transport is deliberately excluded.
- * Under the `ask` approval policy a reviewer denial asks the user; under
- * `never` it is final.
+ * Under the `ask` approval mode (ask the human) a reviewer denial asks the user;
+ * under the fully automatic rejection mode (`never`) it is final.
  *
  * @module @deepseek-ai/dsh-experimental-auto-review
  */
@@ -18,6 +18,7 @@ import type {} from '@deepseek-ai/dsh-tool-executor-ptc/types'
 import type {} from '@deepseek-ai/dsh-working-directory'
 import { FiberState, type Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-agent-instructions'
 import {
   BlockAssembler,
@@ -33,7 +34,7 @@ import { deepFreeze } from '@deepseek-ai/dsh-util-values'
 import { AUTO_PRESET } from '@deepseek-ai/dsh-permission-presets'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-subagent'
-import type {} from '@deepseek-ai/dsh-user-approval'
+import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
 import {
   RUN_CODE_NAME,
   type PreToolDecision,
@@ -60,6 +61,16 @@ const APPROVAL_ERROR_NAME = 'ApprovalError'
 const APPROVAL_REJECTED_CODE = 'APPROVAL_REJECTED'
 /** Approval code for a call whose approval channel cannot answer. */
 const APPROVAL_UNAVAILABLE_CODE = 'APPROVAL_UNAVAILABLE'
+/** Structured error name persisted when a human approval wait times out. */
+const AUTO_REVIEW_APPROVAL_TIMEOUT_ERROR_NAME = 'AutoReviewApprovalTimeoutError'
+/** Structured error code persisted when a human approval wait times out. */
+const AUTO_REVIEW_APPROVAL_TIMEOUT_CODE = 'AUTO_REVIEW_APPROVAL_TIMEOUT'
+/**
+ * Largest accepted human-response timeout: 24 hours. The value is a sane human
+ * response bound, and the converted delay stays far below the largest delay a
+ * Node timer and `AbortSignal` deadline represent without clamping.
+ */
+export const MAX_APPROVAL_TIMEOUT_MINUTES = 1_440
 
 /** Fixed policy sent as the review request's system prompt. */
 const REVIEW_POLICY = `REVIEW_POLICY
@@ -162,6 +173,108 @@ interface ScopedPtcStart {
 export const name = 'experimental-auto-review'
 /** Complete host services required before Auto may be advertised. */
 export const inject = ['approval', 'llm', 'permissionPresets', 'sessions', 'tools', 'workingDirectory']
+
+/** Live Loader config entry: volatile fields are refs holding the current value. */
+interface ConfigRef<T> {
+  get(): T
+}
+
+/** One config entry as delivered by the Loader (volatile ref) or a caller (plain value). */
+type ConfigValue<T> = T | ConfigRef<T> | undefined
+
+/** Plugin config supplied by the Loader; absent fields use the schema defaults. */
+export interface AutoReviewConfig {
+  /**
+   * Minutes a human approval question may stay unanswered before the call is
+   * denied. `0` disables the timeout. The field is volatile, so the next
+   * question reads a changed value without remounting the integration.
+   */
+  readonly approvalTimeoutMinutes?: ConfigValue<number>
+}
+
+/**
+ * Loader config schema. The only setting is the human-response timeout; it is
+ * volatile so a settings or config update changes the next question's deadline
+ * instead of requiring a plugin restart. The schema bounds the setting, and the
+ * live value is still re-validated per question because a volatile ref can hold
+ * an untrusted value at read time.
+ */
+export const Config = z.object({
+  approvalTimeoutMinutes: z.number().min(0).max(MAX_APPROVAL_TIMEOUT_MINUTES).default(0).volatile(),
+})
+
+/** Largest delay Node timers and abort deadlines represent without clamping. */
+const MAX_TIMER_DELAY_MS = 2_147_483_647
+
+/** Human-readable description of the accepted setting range, shared by errors. */
+const APPROVAL_TIMEOUT_RANGE = `approvalTimeoutMinutes must be a number of minutes between 0 and ${MAX_APPROVAL_TIMEOUT_MINUTES}; 0 disables the timeout`
+
+/** Read one config entry; Loader volatile refs expose the live value through get(). */
+function readConfigValue<T>(entry: ConfigValue<T>): T | undefined {
+  if (entry === undefined) return undefined
+  if (typeof entry === 'object' && entry !== null && typeof (entry as ConfigRef<T>).get === 'function') {
+    return (entry as ConfigRef<T>).get()
+  }
+  return entry as T
+}
+
+/**
+ * Convert a configured minute timeout into a safe millisecond timer delay.
+ *
+ * Only a missing setting (`undefined`) or an explicit `0` disables the timeout.
+ * Every other invalid configuration throws instead of silently disabling the
+ * deadline, because a configuration mistake must fail the reviewed call closed
+ * rather than leave a pending human question waiting forever:
+ *
+ * - a non-number throws `TypeError` (the Loader schema also rejects it before
+ *   the plugin runs);
+ * - `NaN`, infinities, negative values, values above
+ *   {@link MAX_APPROVAL_TIMEOUT_MINUTES}, and values that round to a zero or
+ *   overflowing delay throw `RangeError`.
+ *
+ * The conversion rounds to whole milliseconds and re-checks the result so a
+ * zero-length or overflowing delay can never reach the deadline scheduler.
+ *
+ * @param value - configured minutes (any untrusted value, including a live
+ * volatile ref's current value).
+ * @returns `0` when the timeout is disabled; otherwise a positive millisecond delay.
+ * @throws {TypeError} when the configured value is not a number.
+ * @throws {RangeError} when the configured value is outside the supported range.
+ */
+export function resolveApprovalTimeoutMs(value: unknown): number {
+  if (value === undefined) return 0
+  if (typeof value !== 'number') {
+    throw new TypeError(`auto-review: ${APPROVAL_TIMEOUT_RANGE}; got a value of type ${typeof value}`)
+  }
+  if (!Number.isFinite(value) || value < 0 || value > MAX_APPROVAL_TIMEOUT_MINUTES) {
+    throw new RangeError(`auto-review: ${APPROVAL_TIMEOUT_RANGE}; got ${String(value)}`)
+  }
+  if (value === 0) return 0
+  const milliseconds = Math.round(value * 60_000)
+  if (milliseconds <= 0 || milliseconds > MAX_TIMER_DELAY_MS) {
+    throw new RangeError(
+      `auto-review: ${APPROVAL_TIMEOUT_RANGE}; the value resolves to an unsupported delay (${milliseconds}ms)`,
+    )
+  }
+  return milliseconds
+}
+
+/** Structured error identity for a human approval wait that exceeds its timeout. */
+export class AutoReviewApprovalTimeoutError extends Error {
+  /** Persisted code diagnostic consumers receive in `info.code`. */
+  readonly code = AUTO_REVIEW_APPROVAL_TIMEOUT_CODE
+  /** The configured wait that elapsed, in milliseconds. */
+  readonly timeoutMs: number
+
+  /**
+   * @param timeoutMs - the configured wait that elapsed.
+   */
+  constructor(timeoutMs: number) {
+    super(`human approval was not answered within ${timeoutMs}ms`)
+    this.name = AUTO_REVIEW_APPROVAL_TIMEOUT_ERROR_NAME
+    this.timeoutMs = timeoutMs
+  }
+}
 
 /** Return JSON text for one immutable logged value. */
 function json(value: unknown): string {
@@ -704,13 +817,17 @@ async function classifyRisk(
 }
 
 /**
- * Resolve the session's effective approval policy exactly as the approval
- * service does: the last logged override, else the configured default. The
- * official plugin only tested `overrideOf()`, which misses a deployment whose
- * default policy is `never`; treating that default as `ask` would mislabel an
- * automatic rejection as a human decision.
+ * Resolve the session's live approval mode (人工审批方式) exactly as the
+ * approval service does: the last logged override, else the configured default.
+ * The underlying official values stay `ask` / `never`, where `ask` asks the
+ * human and `never` rejects automatically without asking; this fork-local name
+ * only makes the read easier to reason about.
+ *
+ * The official plugin only tested `overrideOf()`, which misses a deployment
+ * whose default mode is the fully automatic rejection (`never`); treating that
+ * default as `ask` would mislabel an automatic rejection as a human decision.
  */
-function effectiveApprovalPolicy(ctx: Context, agent: Agent): 'ask' | 'never' {
+function resolveApprovalMode(ctx: Context, agent: Agent): 'ask' | 'never' {
   return ctx.approval.overrideOf(agent.session) ?? ctx.approval.config.policy ?? 'ask'
 }
 
@@ -730,53 +847,66 @@ function denied(exec: ToolExecution, reason?: string): PreToolDecision {
 }
 
 /**
- * Put one reviewer-denied call to the composed approval answerers.
+ * Materialize a denial caused by a human approval question that stayed
+ * unanswered past the configured timeout.
  *
- * The official plugin returned an `ask` pre-execute decision and let
- * `ToolsPipeline.prepare()` resolve it through its private `serviceAsk()`. That
- * path maps a human rejection to a fixed `the user rejected tool "<name>"`
- * denial, so the reviewer's concern never reached the Agent. Calling the same
- * public approval seam from here preserves the audited `approval/asked` +
- * `approval/decided` pair, the `'never'` policy gate, answerer routing and the
- * one-question-per-call contract, while letting the mapped denial keep the
- * reviewer's concise reason. The request signal is the reviewed call's signal
- * fused with this integration's disposal signal, so teardown withdraws a
- * pending question instead of leaving a grant able to dispatch after unload.
+ * The text names the human non-response explicitly so it can never be mistaken
+ * for a human or reviewer rejection of the call, keeps the reviewer's concise
+ * concern when one exists, and records the timeout as its own persisted error
+ * identity instead of reusing `AutoReviewDeniedError` or `ApprovalError`.
+ *
+ * @param exec - immutable pending execution whose body stays unexecuted.
+ * @param timeoutMs - configured wait that elapsed, in milliseconds.
+ * @param reason - optional concise reviewer decision reason.
+ * @returns the deny decision replacing the pending approval question.
+ */
+function approvalTimedOut(exec: ToolExecution, timeoutMs: number, reason?: string): PreToolDecision {
+  const minutes = timeoutMs / 60_000
+  const duration = `${minutes} minute${minutes === 1 ? '' : 's'}`
+  const text = `Auto review denied tool "${exec.name}": the human approval request timed out after ${duration} with no response; its body was not executed`
+  return {
+    kind: 'deny',
+    reason: reason === undefined || reason.trim().length === 0
+      ? text
+      : `${text}; Auto review concern: ${reason}`,
+    info: {
+      name: AUTO_REVIEW_APPROVAL_TIMEOUT_ERROR_NAME,
+      code: AUTO_REVIEW_APPROVAL_TIMEOUT_CODE,
+      ...reason === undefined ? {} : { reason },
+    },
+  }
+}
+
+/**
+ * Map one settled approval outcome onto the pipeline decision that replaces the
+ * `ask` gate.
  *
  * @param ctx - composed harness context owning the approval seam.
  * @param agent - the reviewed call's agent, which routes and audits the ask.
  * @param exec - immutable pending execution.
- * @param signal - call lifetime fused with the integration lifecycle.
+ * @param outcome - the closed approval outcome.
  * @param reason - optional concise reviewer decision reason.
- * @returns the allow/deny/cancel decision that replaces the `ask` gate.
+ * @returns the allow/deny/cancel decision.
  */
-async function askUser(
+function mapApprovalOutcome(
   ctx: Context,
   agent: Agent,
   exec: ToolExecution,
-  signal: AbortSignal,
+  outcome: ApprovalOutcome,
   reason?: string,
-): Promise<PreToolDecision> {
-  const denial = `Auto review denied tool "${exec.name}"`
-  const outcome = await ctx.approval.request({
-    agent,
-    toolName: exec.name,
-    callId: exec.callId,
-    reason: reason === undefined ? denial : `${denial}: ${reason}`,
-    displayReason: deniedDisplayReason(reason),
-    signal,
-  })
+): PreToolDecision {
   switch (outcome) {
     case 'allowed-once':
       // The pipeline still applies synchronous guards and only then dispatches,
       // exactly as it would for the approval service's own grant.
       return { kind: 'allow' }
     case 'rejected':
-      // A `never` policy decides `rejected` without asking a human. Re-read the
-      // effective policy so that race, or a default-never deployment, is
+      // An approval mode that changed to the fully automatic rejection between
+      // the question and its answer decides `rejected` without asking a human.
+      // Re-read the live mode so that race, or a default-never deployment, is
       // reported as an automatic reviewer denial instead of a fabricated user
       // rejection.
-      if (effectiveApprovalPolicy(ctx, agent) === 'never') return denied(exec, reason)
+      if (resolveApprovalMode(ctx, agent) === 'never') return denied(exec, reason)
       return {
         kind: 'deny',
         reason: reason === undefined || reason.trim().length === 0
@@ -800,6 +930,127 @@ async function askUser(
   }
 }
 
+/** One human-approval wait: a settled outcome, or the elapsed deadline. */
+type ApprovalWait =
+  | { readonly kind: 'outcome'; readonly outcome: ApprovalOutcome }
+  | { readonly kind: 'timeout' }
+
+/**
+ * Await one approval question, settling early when the deadline aborts.
+ *
+ * The question's signal is the caller's signal composed with the deadline, so
+ * the approval service itself withdraws the pending question and discards a
+ * late answer when the deadline aborts. This race additionally guarantees the
+ * deadline wins even for an approval implementation that ignores its signal.
+ *
+ * @param ctx - composed harness context owning the approval seam.
+ * @param request - the public approval request, already carrying the composed signal.
+ * @param deadline - controller aborted when the configured wait elapses.
+ * @returns the settled outcome, or a timeout settlement.
+ */
+async function waitForApproval(
+  ctx: Context,
+  request: ApprovalRequest,
+  deadline: AbortController,
+): Promise<ApprovalWait> {
+  const pending = ctx.approval.request(request)
+  let onDeadline: (() => void) | undefined
+  const timedOut = new Promise<ApprovalWait>((resolve) => {
+    onDeadline = () => resolve({ kind: 'timeout' })
+    if (deadline.signal.aborted) onDeadline()
+    else deadline.signal.addEventListener('abort', onDeadline, { once: true })
+  })
+  try {
+    const settled = pending.then((outcome): ApprovalWait => ({ kind: 'outcome', outcome }))
+    return await Promise.race([settled, timedOut])
+  } finally {
+    if (onDeadline !== undefined) deadline.signal.removeEventListener('abort', onDeadline)
+    // Once the deadline has withdrawn the question, a late rejection of that
+    // request is cleanup noise; keep it from becoming an unhandled rejection.
+    if (deadline.signal.aborted) pending.catch(() => {})
+  }
+}
+
+/**
+ * Put one reviewer-denied call to the composed approval answerers.
+ *
+ * The official plugin returned an `ask` pre-execute decision and let
+ * `ToolsPipeline.prepare()` resolve it through its private `serviceAsk()`. That
+ * path maps a human rejection to a fixed `the user rejected tool "<name>"`
+ * denial, so the reviewer's concern never reached the Agent. Calling the same
+ * public approval seam from here preserves the audited `approval/asked` +
+ * `approval/decided` pair, the `'never'` policy gate, answerer routing and the
+ * one-question-per-call contract, while letting the mapped denial keep the
+ * reviewer's concise reason. The request signal is the reviewed call's signal
+ * fused with this integration's disposal signal, so teardown withdraws a
+ * pending question instead of leaving a grant able to dispatch after unload.
+ *
+ * A positive `approvalTimeoutMinutes` derives one additional deadline for this
+ * question only. That deadline joins the composed signal, so a timeout
+ * withdraws the pending question exactly like a cancellation and a late human
+ * answer is discarded by the approval service. A timeout is reported as human
+ * non-response, never as a human rejection, and the call body never executes.
+ * `approval = never` never reaches this function: its automatic denial path
+ * short-circuits before any question or timer exists.
+ *
+ * @param ctx - composed harness context owning the approval seam.
+ * @param agent - the reviewed call's agent, which routes and audits the ask.
+ * @param exec - immutable pending execution.
+ * @param signal - call lifetime fused with the integration lifecycle.
+ * @param timeoutConfig - live human-response timeout in minutes (0 disables).
+ * @param reason - optional concise reviewer decision reason.
+ * @returns the allow/deny/cancel decision that replaces the `ask` gate.
+ */
+async function askUser(
+  ctx: Context,
+  agent: Agent,
+  exec: ToolExecution,
+  signal: AbortSignal,
+  timeoutConfig: ConfigValue<number>,
+  reason?: string,
+): Promise<PreToolDecision> {
+  const denial = `Auto review denied tool "${exec.name}"`
+  const request: ApprovalRequest = {
+    agent,
+    toolName: exec.name,
+    callId: exec.callId,
+    reason: reason === undefined ? denial : `${denial}: ${reason}`,
+    displayReason: deniedDisplayReason(reason),
+    signal,
+  }
+  const timeoutMs = resolveApprovalTimeoutMs(readConfigValue(timeoutConfig))
+  if (timeoutMs === 0 || isAborted(signal)) {
+    return mapApprovalOutcome(ctx, agent, exec, await ctx.approval.request(request), reason)
+  }
+  // Derive the deadline only for a question that is really about to wait for a
+  // human; the timer is always cleared when the question settles.
+  const deadline = new AbortController()
+  const timer = setTimeout(
+    () => deadline.abort(new AutoReviewApprovalTimeoutError(timeoutMs)),
+    timeoutMs,
+  )
+  try {
+    const combined = AbortSignal.any([signal, deadline.signal])
+    const wait = await waitForApproval(ctx, { ...request, signal: combined }, deadline)
+    if (wait.kind === 'timeout') {
+      // Caller cancellation and integration teardown stay cancellations even
+      // when they race the deadline; they are not human non-response.
+      return isAborted(signal)
+        ? mapApprovalOutcome(ctx, agent, exec, 'cancelled', reason)
+        : approvalTimedOut(exec, timeoutMs, reason)
+    }
+    const decision = mapApprovalOutcome(ctx, agent, exec, wait.outcome, reason)
+    if (decision.kind === 'cancel' && isAborted(deadline.signal) && !isAborted(signal)) {
+      // The approval service observed the deadline abort before this race did:
+      // the question was withdrawn because no human answered in time.
+      return approvalTimedOut(exec, timeoutMs, reason)
+    }
+    return decision
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /** Materialize a reviewer failure as its own error rather than a denial. */
 function failed(exec: ToolExecution, error: unknown): PreToolDecision {
   const message = error instanceof Error ? error.message : String(error)
@@ -811,7 +1062,7 @@ function failed(exec: ToolExecution, error: unknown): PreToolDecision {
 }
 
 /** Install the Auto preset and its review gate; preserve Session selection on application shutdown. */
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config: AutoReviewConfig = {}): void {
   // Retain the injected service while this context drains on disposal.
   const permissionPresets = ctx.permissionPresets
   let accepting = true
@@ -848,16 +1099,18 @@ export function apply(ctx: Context): void {
         if (isAborted(lifecycle.signal)) return { kind: 'cancel' }
         if (!review.ok) return failed(exec, review.error)
         const { decision } = review
-        // The permission owner pins an approval policy into every published
-        // Session; a delegated child pins `never`. Use the same effective read
-        // as the approval service so a default-`never` deployment is automatic.
-        if (decision.decision === 'deny' && effectiveApprovalPolicy(ctx, agent) === 'never') {
+        // The permission owner pins an approval mode (人工审批方式) into every
+        // published Session; a delegated child pins the fully automatic
+        // rejection mode. Resolve the same live mode as the approval service so
+        // a default-never deployment rejects automatically.
+        const approvalMode = resolveApprovalMode(ctx, agent)
+        if (decision.decision === 'deny' && approvalMode === 'never') {
           return denied(exec, decision.reason)
         }
         const downstream = await next()
         if (isAborted(lifecycle.signal)) return { kind: 'cancel' }
         if (decision.decision === 'allow' || downstream.kind !== 'allow') return downstream
-        return askUser(ctx, agent, exec, signal, decision.reason)
+        return askUser(ctx, agent, exec, signal, config.approvalTimeoutMinutes, decision.reason)
       } finally {
         active.delete(completed.promise)
         completed.resolve()

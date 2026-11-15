@@ -137,6 +137,7 @@ export function createHarness(options) {
     preset = 'auto',
     defaultApprovalPolicy = 'ask',
     approvalPolicyOverride,
+    config,
     cwd = '/workspace',
     rootFiberState = FiberState.ACTIVE,
   } = options
@@ -389,7 +390,11 @@ export function createHarness(options) {
     return disposeEffect
   }
 
-  plugin.apply(ctx)
+  // A Loader always passes the parsed config (volatile refs with schema
+  // defaults); tests may omit it entirely to exercise the plugin's own
+  // no-config default path.
+  if (config === undefined) plugin.apply(ctx)
+  else plugin.apply(ctx, config)
 
   harness.ctx = ctx
   harness.newSession = newSession

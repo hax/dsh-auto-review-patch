@@ -1,14 +1,14 @@
 /**
  * Approval-path behavior for the denial-feedback patch.
  *
- * Under the interactive `ask` policy the patched plugin calls the public
- * approval seam itself instead of returning an `ask` gate, because the tool
- * pipeline's private `serviceAsk()` would otherwise replace the reviewer's
- * concern with a fixed "the user rejected ..." text. These tests lock the four
- * approval outcomes, their structured error codes, the audited ask/decide pair,
- * no duplicate question, effective-policy handling, teardown cancellation, and
- * the invariants that reviewer grants bypass the question and a downstream
- * pre-execute denial keeps precedence.
+ * Under the interactive `ask` approval mode (ask the human) the patched plugin
+ * calls the public approval seam itself instead of returning an `ask` gate,
+ * because the tool pipeline's private `serviceAsk()` would otherwise replace
+ * the reviewer's concern with a fixed "the user rejected ..." text. These tests
+ * lock the four approval outcomes, their structured error codes, the audited
+ * ask/decide pair, no duplicate question, approval-mode handling, teardown
+ * cancellation, and the invariants that reviewer grants bypass the question and
+ * a downstream pre-execute denial keeps precedence.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'

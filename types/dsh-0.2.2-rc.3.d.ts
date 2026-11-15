@@ -218,6 +218,32 @@ interface TrimmedPermissionPresets {
 // Side-effect type imports in the upstream source augment these packages.
 declare module '@deepseek-ai/dsh-agent-instructions' {}
 declare module '@deepseek-ai/dsh-subagent' {}
-declare module '@deepseek-ai/dsh-user-approval' {}
+declare module '@deepseek-ai/dsh-user-approval' {
+  export type ApprovalOutcome = TrimmedApprovalOutcome
+  export type ApprovalRequest = TrimmedApprovalRequest
+}
 declare module '@deepseek-ai/dsh-working-directory' {}
 declare module '@deepseek-ai/dsh-tool-executor-ptc/types' {}
+
+/**
+ * Trimmed `@deepseek-ai/schemastery` declarations covering only the Loader
+ * config schema the fork builds: an object with volatile number fields. The
+ * real package supplies the same surface with full validation at runtime.
+ */
+declare module '@deepseek-ai/schemastery' {
+  export interface Schema<T = unknown> {
+    readonly meta: { readonly volatile?: boolean; readonly default?: T; readonly min?: number; readonly max?: number }
+    default(value: T): Schema<T>
+    volatile(): Schema<T>
+  }
+  export interface NumberSchema extends Schema<number> {
+    min(value: number): NumberSchema
+    max(value: number): NumberSchema
+  }
+  export interface SchemaFactory {
+    number(): NumberSchema
+    object(shape: Record<string, Schema<any>>): Schema<unknown>
+  }
+  const z: SchemaFactory
+  export default z
+}

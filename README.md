@@ -1,16 +1,24 @@
-# dsh-experimental-auto-review fork: concise reviewer denial reasons
+# dsh-experimental-auto-review fork: denial reasons and human-response timeout
 
 Unofficial standalone fork of the official DSH package
-`@deepseek-ai/dsh-experimental-auto-review`, implementing
-[Issue #3](https://github.com/hax/dsh-auto-review-model/issues/3): return a
-concise reviewer denial reason to the Agent without changing risk
-classification, allow/deny decisions, the approval policy, or the "denied tool
-body never executes" invariant.
+`@deepseek-ai/dsh-experimental-auto-review`, implementing:
+
+- [Issue #3](https://github.com/hax/dsh-auto-review-model/issues/3): return a
+  concise reviewer denial reason to the Agent without changing risk
+  classification, allow/deny decisions, the approval mode (人工审批方式), or the
+  "denied tool body never executes" invariant (commit `56a0252`, preserved);
+- [Issue #5](https://github.com/hax/dsh-auto-review-model/issues/5): add a
+  configurable minute-level **human-response timeout** for the one human
+  approval question this patch may ask, denying as human non-response instead of
+  waiting forever.
 
 This repository is an **unofficial patch/fork**: it is not published and is
 not installed in the running profile by this task. It is based
 on the current DSH `0.2.2-rc.3` official source; exact upstream provenance is in
-[UPSTREAM.md](UPSTREAM.md).
+[UPSTREAM.md](UPSTREAM.md). The production delta is stored as two independent,
+ordered patches: `patches/0001-return-concise-reviewer-denial-reasons.patch`
+(Issue #3, frozen) and `patches/0002-add-human-approval-timeout.patch`
+(Issue #5).
 
 ## Behavior
 
@@ -27,9 +35,10 @@ behavior or text of this path changed.
 
 ### 2. Fully automatic denial (`approval = never`)
 
-Under the Auto review preset, a `never` approval policy (explicitly pinned, or
-the configured default) resolves a reviewer denial automatically. The Agent's
-tool result now appends the reviewer's optional concise `decision.reason`:
+Under the Auto review preset, a `never` approval mode (全自动拒绝; explicitly
+pinned, or the configured default) resolves a reviewer denial automatically
+without asking the human. The Agent's tool result now appends the reviewer's
+optional concise `decision.reason`:
 
 ```
 Auto review rejected tool "<name>"; its body was not executed: <decision.reason>
@@ -43,13 +52,16 @@ Auto review rejected tool "<name>"; its body was not executed: <decision.reason>
   never included: only the closed-protocol `decision.reason` string is used.
 - The denied body is never executed and no human question is asked.
 
-The effective policy is read as
+The session's approval mode (人工审批方式) is read as
 `approval.overrideOf(session) ?? approval.config.policy ?? 'ask'` — the same
-resolution the approval service uses. A deployment whose *default* policy is
-`never` therefore also gets the automatic denial path instead of a fabricated
-"the user rejected" message.
+resolution the approval service uses. The two modes are `ask` (询问人类 — ask
+the human) and `never` (全自动拒绝 — reject automatically without asking); this
+fork names the read `resolveApprovalMode`, while the persisted official
+`approval.policy` values stay `ask` / `never` unchanged. A deployment whose
+*default* mode is `never` therefore also gets the automatic denial path instead
+of a fabricated "the user rejected" message.
 
-### 3. Interactive denial (`ask` policy)
+### 3. Interactive denial (`ask` mode: 询问人类)
 
 The reviewer's denial still asks exactly one human question through the
 existing approval seam, with the same audited `approval/asked` +
@@ -76,6 +88,70 @@ existing approval seam, with the same audited `approval/asked` +
   `tool "<name>" requires approval, but no approval channel is available` denial
   (`ApprovalError` / `APPROVAL_UNAVAILABLE`).
 
+### 4. Minute-level human-response timeout (`approvalTimeoutMinutes`)
+
+The fork adds one Loader config setting:
+
+| Field | Type | Default | Range | Semantics |
+| --- | --- | --- | --- | --- |
+| `approvalTimeoutMinutes` | number (minutes) | `0` | `0` … `1440` (24 h) | `0` disables the timeout. Any positive finite value (fractions allowed) becomes a deadline for one human approval question. |
+
+The field is declared in the exported Loader schema (`Config`) with
+`schemastery`'s `.volatile()`, and the plugin reads the live value **once per
+human question**, so a settings/config update changes the next question's
+deadline without remounting the integration.
+
+How the deadline works:
+
+- the timer is derived **only** when the plugin really calls
+  `ctx.approval.request()` for a reviewer-denied call under an effective `ask`
+  approval mode (询问人类); reviewer allow/deny paths, downstream denials and
+  the automatic `never` path never create one;
+- the question's signal becomes
+  `AbortSignal.any([call signal, integration disposal signal, deadline signal])`,
+  so a timeout withdraws the pending question exactly like a cancellation and
+  the approval service discards a late human answer by construction;
+- reaching the deadline returns a `deny` decision and the tool body is never
+  executed:
+
+  ```
+  Auto review denied tool "<name>": the human approval request timed out after <n> minutes with no response; its body was not executed
+  ```
+
+  with the reviewer's concise concern appended when present
+  (`; Auto review concern: <decision.reason>`) and
+  `info: { name: 'AutoReviewApprovalTimeoutError', code:
+  'AUTO_REVIEW_APPROVAL_TIMEOUT', reason? }`. The text never says "the user
+  rejected", so the Agent can tell human non-response apart from a human or
+  reviewer rejection; without a reviewer reason no concern is invented;
+- caller cancellation and integration teardown keep their existing
+  `tool call aborted before dispatch` result and take precedence over the
+  deadline; a late allow or reject is ignored and cannot execute the body;
+- only a missing setting or an explicit `0` disables the timeout. Non-numbers,
+  `NaN`, infinities, negative values, and values above the 24-hour cap are
+  rejected with an actionable `TypeError` or `RangeError`; a bad setting cannot
+  silently turn into an unlimited approval wait. The Loader schema declares the
+  same `0..1440` bounds, and every live value is checked again before use (the
+  live check also rejects `NaN`, which the schema's range comparison alone lets
+  through). The conversion rounds minutes to whole milliseconds and rejects any
+  zero-length or overflowing delay;
+- the existing approval failure containment is unchanged: an approval request
+  that throws still fails the call exactly as before and the timer is cleared.
+
+Configure it in the profile patch alongside the inserted plugin row:
+
+```yaml
+- id: auto-review
+  name: "@deepseek-ai/dsh-experimental-auto-review"
+  config:
+    approvalTimeoutMinutes: 5
+```
+
+Scope limit: the deadline belongs to the plugin's own direct approval question.
+A downstream `ask` gate produced by another pre-execute listener (after a
+reviewer allow, or outside the reviewer-denial path) is still resolved by
+`ToolsPipeline`'s private `serviceAsk()` and is **not** timed by this patch.
+
 ### Why the plugin calls `approval.request()` itself
 
 `ToolsPipeline.prepare()` applies the `tools/pre-execute` waterfall **first**
@@ -101,9 +177,9 @@ The minimal reliable fix is therefore to call the **public**
 - keeps one audited question per call (the pipeline no longer sees an `ask`
   gate, so its `serviceAsk()` cannot ask a second time);
 - keeps the `never` policy gate inside `ApprovalService` authoritative;
-- provides the signal hook the separate #5 minute-level human-response timeout
-  will need (`signal` is the call lifetime fused with the integration's
-  disposal signal; no timeout is implemented in this task).
+- puts this question — and only this question — on the #5 minute-level deadline:
+  the request signal fuses the call lifetime, the integration disposal signal
+  and, when configured, the human-response deadline.
 
 ## Upstream drift risk
 
@@ -130,19 +206,30 @@ and the upstream ask-path tests assert only `the user rejected tool "<name>"`.
 Porting this patch upstream requires updating those assertions together with
 the new regression tests in this repository.
 
+The #5 additions are fork-only as well: the official plugin exports no `Config`
+schema, so `approvalTimeoutMinutes`, `AutoReviewApprovalTimeoutError` and
+`AUTO_REVIEW_APPROVAL_TIMEOUT` have no upstream counterpart. This fork therefore
+depends on `@deepseek-ai/schemastery` (`~3.19.0`, the version upstream DSH
+packages declare) for its Loader config schema; official Auto review does not.
+The upstream spec does not cover a human-response timeout at all, so the
+regression tests in this repository are its only automated coverage.
+
 ## Layout
 
 ```
-src/index.ts                 patched production source (real official code + minimal patch)
+src/index.ts                 patched production source (real official code + two minimal patches)
 src/locales.ts               verbatim upstream production source
 types/                       trimmed 0.2.2-rc.3 ambient declarations for offline typecheck
 upstream/dsh-v0.2.2-rc.3/    pristine upstream snapshot + SHA256SUMS
-patches/0001-*.patch         complete production-source delta vs the pristine snapshot
+patches/0001-*.patch         Issue #3 denial-reason delta vs the pristine snapshot (frozen)
+patches/0002-*.patch         Issue #5 human-response timeout delta, applied after 0001
 tests/harness/               deterministic fake Cordis context / Session / tool pipeline
-tests/stubs/                 test doubles for the five runtime @deepseek-ai imports
-tests/denial-feedback.test.mjs   never policy, failure, CoT and body-suppression tests
-tests/ask-approval.test.mjs      approval mapping/audit/effective-policy/teardown tests
-scripts/verify-upstream.mjs  offline provenance and patch-reproduction checks
+tests/stubs/                 test doubles for the six runtime @deepseek-ai imports
+tests/denial-feedback.test.mjs    never-mode denial, failure, CoT and body-suppression tests
+tests/ask-approval.test.mjs       approval mapping/audit/approval-mode/teardown tests
+tests/approval-timeout.test.mjs   timeout config, deadline, late-answer, cancellation and cleanup tests
+scripts/make-patch.mjs       regenerates patches/0002 from the pristine snapshot + patch 0001
+scripts/verify-upstream.mjs  offline provenance and ordered patch-reproduction checks
 ```
 
 The upstream monorepo test suite is not vendored: it requires the full pnpm
@@ -155,7 +242,12 @@ production source (or the built `lib/` artifact) against them.
 ## Build and test
 
 Requirements: Node.js ≥ 22.18 (native TypeScript stripping for the source
-tests). The only devDependency is TypeScript 5.7.3.
+tests). The only devDependency is TypeScript 5.7.3. The package declares one
+runtime dependency, `@deepseek-ai/schemastery` (`~3.19.0`), for the Loader
+config schema added by Issue #5. This offline workflow does not install it: the
+tests resolve a local test double and typecheck uses trimmed ambient
+declarations, so a real installation must resolve that dependency from the DSH
+package tree or a registry.
 
 ### Offline dev-dependency bootstrap
 
@@ -176,7 +268,7 @@ npm test                   # run tests against src/ via Node's TypeScript stripp
 npm run build              # emit lib/index.js + lib/locales.js (+ .d.ts)
 npm run test:lib           # run the same tests against the built lib/ artifact
 npm run check              # node --check on built JS and the verify script
-npm run verify:upstream    # snapshot hashes, patch applies, patched source byte-equal
+npm run verify:upstream    # snapshot hashes; pristine + 0001 + 0002 == src/index.ts; 0001 == commit 56a0252
 npm run verify             # all of the above, from an empty node_modules
 ```
 
@@ -184,13 +276,15 @@ On a networked machine a plain `npm install` remains available; the vendored
 tarball is only the deterministic offline path for the current no-install
 verification environment.
 
-Current status in this working tree: `typecheck` clean, 21/21 tests pass in
-both source and `lib/` modes, builds and syntax checks pass, 8/8 offline
-provenance checks pass, and `git diff --check` is clean. This was re-verified
-from an empty `node_modules` in a plain shell with no `tsc` on `PATH`:
-`npm run verify` bootstraps the vendored TypeScript offline and completes in
-about four seconds, and `npm run typecheck` / `npm run build` work standalone
-the same way.
+Current status in this working tree: `typecheck` clean, 42/42 tests pass in
+both source and `lib/` modes (21 Issue #3 + 21 Issue #5), builds and syntax
+checks pass, 10/10 offline provenance checks pass (pristine + 0001 + 0002
+reconstruct `src/index.ts` byte-for-byte, and 0001 still reproduces the
+committed Issue #3 source at `56a0252`), and `git diff --check` is clean. This
+was re-verified from an empty `node_modules` in a plain shell with no `tsc` on
+`PATH`: `npm run verify` bootstraps the vendored TypeScript offline and
+completes in a few seconds, and `npm run typecheck` / `npm run build` work
+standalone the same way.
 
 ### Coverage limits in this standalone fork
 
@@ -200,19 +294,31 @@ the same way.
   which is not executed here (it requires the full pnpm workspace).
 - `npm run typecheck` checks the production source against trimmed 0.2.2-rc.3
   ambient declarations (`types/`), not against the full monorepo type graph.
+  The Loader delivery of a volatile `Config` is modeled with a local
+  `schemastery` test double and trimmed declarations; real Loader config
+  parsing/volatile update was not exercised without an install, and the runtime
+  `@deepseek-ai/schemastery` dependency is not installed by this no-install
+  workflow.
+- Human-response timeouts run against real timers but sub-second deadlines
+  (fractional minutes such as `0.001` = 60 ms, bounded by a per-test timeout);
+  no test waits for minutes, and no multi-minute wall-clock behavior is
+  measured.
+- Only the plugin's own direct approval question is timed; a downstream `ask`
+  gate resolved by `ToolsPipeline`'s private `serviceAsk()` is out of scope (see
+  the behavior section).
 - No live DSH route, real `ApprovalService` or real model was exercised: this
   task does not install the fork. Real-process verification belongs to the
   separate installation/verification workstream.
 
 ## Explicit non-goals of this task
 
-- No minute-level human-response timeout (#5) — only the map-to-deny design and
-  signal hook are prepared.
 - No changes to the official installed package, app.asar, current profile,
-  `model-router` or the global `ApprovalService`.
+  `model-router`, the global `ApprovalService` or `ToolsPipeline`.
 - No install, commit, or push.
 - No human-reason input UI or approval-protocol extension; the reviewer's
   concise `decision.reason` is the only additional text forwarded.
+- No timeout for approval questions this plugin does not ask itself (the
+  pipeline's own downstream `ask` gate).
 
 ## License
 

@@ -1,5 +1,5 @@
 /**
- * ESM resolve hooks that replace the five runtime `@deepseek-ai/*` imports of
+ * ESM resolve hooks that replace the six runtime `@deepseek-ai/*` imports of
  * the patched plugin with deterministic local test doubles.
  *
  * The standalone fork cannot install the upstream pnpm workspace, so tests run
@@ -18,6 +18,7 @@ const mapping = new Map([
   ['@deepseek-ai/dsh-util-values', join(here, 'dsh-util-values.mjs')],
   ['@deepseek-ai/dsh-permission-presets', join(here, 'dsh-permission-presets.mjs')],
   ['@deepseek-ai/dsh-tools', join(here, 'dsh-tools.mjs')],
+  ['@deepseek-ai/schemastery', join(here, 'schemastery.mjs')],
 ])
 
 registerHooks({
