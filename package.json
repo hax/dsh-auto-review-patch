@@ -1,0 +1,74 @@
+{
+  "name": "@deepseek-ai/dsh-experimental-auto-review",
+  "description": "Unofficial standalone fork of DSH Auto review that returns concise reviewer denial reasons to the Agent",
+  "version": "0.2.2-rc.3",
+  "private": true,
+  "icon": "./icon.svg",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hax/dsh-auto-review-patch.git"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./locale/*.json": "./locale/*.json",
+    "./src/*": "./src/*",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "icon.svg",
+    "locale/*.json",
+    "lib/index.js",
+    "lib/index.d.ts",
+    "lib/locales.js",
+    "lib/locales.d.ts",
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "UPSTREAM.md"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "node --check lib/index.js && node --check lib/locales.js && node --check scripts/verify-upstream.mjs",
+    "test": "node --import ./tests/stubs/register.mjs --test tests/*.test.mjs",
+    "test:lib": "AUTO_REVIEW_TEST_TARGET=lib node --import ./tests/stubs/register.mjs --test tests/*.test.mjs",
+    "verify:upstream": "node scripts/verify-upstream.mjs",
+    "verify": "npm run typecheck && npm test && npm run build && npm run test:lib && npm run check && npm run verify:upstream",
+    "bootstrap:offline": "node scripts/bootstrap-offline-deps.mjs",
+    "pretypecheck": "node scripts/bootstrap-offline-deps.mjs",
+    "prebuild": "node scripts/bootstrap-offline-deps.mjs",
+    "preverify": "node scripts/bootstrap-offline-deps.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/dsh-agent": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-agent-instructions": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-permission-presets": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-subagent": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-user-approval": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-util-values": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-working-directory": "0.2.2-rc.3"
+  },
+  "devDependencies": {
+    "typescript": "5.7.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

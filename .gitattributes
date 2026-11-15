@@ -1,0 +1,3 @@
+# Stored unified diffs contain a single-space prefix on blank context lines by
+# format definition; do not report those prefixes as whitespace errors.
+patches/*.patch whitespace=-blank-at-eol

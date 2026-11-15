@@ -1,0 +1,153 @@
+# Fork patch for @deepseek-ai/dsh-experimental-auto-review 0.2.2-rc.3
+# Upstream: deepseek-ai/deepseek-harness tag dsh-v0.2.2-rc.3
+#           commit 38a6a5c965aa99ab525161efb7cc5cf1fe62fced
+# Path:     packages/experimental/auto-review/src/index.ts
+# Apply:    git apply -p1 patches/0001-return-concise-reviewer-denial-reasons.patch
+#           (or: npm run verify:upstream checks it reproduces this fork's src/index.ts)
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -49,6 +49,17 @@
+ const AUTO_REVIEW_FAILED_ERROR_NAME = 'AutoReviewFailedError'
+ /** Structured error code persisted when review cannot produce a decision. */
+ const AUTO_REVIEW_FAILED_CODE = 'AUTO_REVIEW_FAILED'
++/**
++ * Structured error name the tool registry records when approval does not grant
++ * a call. These three values are a persisted contract consumed by diagnostic
++ * and policy consumers; `@deepseek-ai/dsh-tools` deliberately does not re-export
++ * them, so the fork repeats the exact upstream strings.
++ */
++const APPROVAL_ERROR_NAME = 'ApprovalError'
++/** Approval code for a call the user rejected. */
++const APPROVAL_REJECTED_CODE = 'APPROVAL_REJECTED'
++/** Approval code for a call whose approval channel cannot answer. */
++const APPROVAL_UNAVAILABLE_CODE = 'APPROVAL_UNAVAILABLE'
+ 
+ /** Fixed policy sent as the review request's system prompt. */
+ const REVIEW_POLICY = `REVIEW_POLICY
+@@ -690,13 +701,26 @@
+     signal,
+   })
+   return readDecision(ctx.llm.stream(options))
++}
++
++/**
++ * Resolve the session's effective approval policy exactly as the approval
++ * service does: the last logged override, else the configured default. The
++ * official plugin only tested `overrideOf()`, which misses a deployment whose
++ * default policy is `never`; treating that default as `ask` would mislabel an
++ * automatic rejection as a human decision.
++ */
++function effectiveApprovalPolicy(ctx: Context, agent: Agent): 'ask' | 'never' {
++  return ctx.approval.overrideOf(agent.session) ?? ctx.approval.config.policy ?? 'ask'
+ }
+ 
+ /** Materialize the fixed model-facing final Auto denial plus optional UI detail. */
+ function denied(exec: ToolExecution, reason?: string): PreToolDecision {
+   return {
+     kind: 'deny',
+-    reason: `Auto review rejected tool "${exec.name}"; its body was not executed`,
++    reason: reason === undefined || reason.trim().length === 0
++      ? `Auto review rejected tool "${exec.name}"; its body was not executed`
++      : `Auto review rejected tool "${exec.name}"; its body was not executed: ${reason}`,
+     info: {
+       name: AUTO_REVIEW_DENIED_ERROR_NAME,
+       code: AUTO_REVIEW_DENIED_CODE,
+@@ -706,15 +730,73 @@
+ }
+ 
+ /**
+- * Ask the user to decide one call the reviewer denied. The audited reason is
+- * English; the prompt text is localized and keeps the reviewer's raw reason.
++ * Put one reviewer-denied call to the composed approval answerers.
++ *
++ * The official plugin returned an `ask` pre-execute decision and let
++ * `ToolsPipeline.prepare()` resolve it through its private `serviceAsk()`. That
++ * path maps a human rejection to a fixed `the user rejected tool "<name>"`
++ * denial, so the reviewer's concern never reached the Agent. Calling the same
++ * public approval seam from here preserves the audited `approval/asked` +
++ * `approval/decided` pair, the `'never'` policy gate, answerer routing and the
++ * one-question-per-call contract, while letting the mapped denial keep the
++ * reviewer's concise reason. The request signal is the reviewed call's signal
++ * fused with this integration's disposal signal, so teardown withdraws a
++ * pending question instead of leaving a grant able to dispatch after unload.
++ *
++ * @param ctx - composed harness context owning the approval seam.
++ * @param agent - the reviewed call's agent, which routes and audits the ask.
++ * @param exec - immutable pending execution.
++ * @param signal - call lifetime fused with the integration lifecycle.
++ * @param reason - optional concise reviewer decision reason.
++ * @returns the allow/deny/cancel decision that replaces the `ask` gate.
+  */
+-function askUser(exec: ToolExecution, reason?: string): PreToolDecision {
++async function askUser(
++  ctx: Context,
++  agent: Agent,
++  exec: ToolExecution,
++  signal: AbortSignal,
++  reason?: string,
++): Promise<PreToolDecision> {
+   const denial = `Auto review denied tool "${exec.name}"`
+-  return {
+-    kind: 'ask',
++  const outcome = await ctx.approval.request({
++    agent,
++    toolName: exec.name,
++    callId: exec.callId,
+     reason: reason === undefined ? denial : `${denial}: ${reason}`,
+     displayReason: deniedDisplayReason(reason),
++    signal,
++  })
++  switch (outcome) {
++    case 'allowed-once':
++      // The pipeline still applies synchronous guards and only then dispatches,
++      // exactly as it would for the approval service's own grant.
++      return { kind: 'allow' }
++    case 'rejected':
++      // A `never` policy decides `rejected` without asking a human. Re-read the
++      // effective policy so that race, or a default-never deployment, is
++      // reported as an automatic reviewer denial instead of a fabricated user
++      // rejection.
++      if (effectiveApprovalPolicy(ctx, agent) === 'never') return denied(exec, reason)
++      return {
++        kind: 'deny',
++        reason: reason === undefined || reason.trim().length === 0
++          ? `the user rejected tool "${exec.name}"`
++          : `the user rejected tool "${exec.name}"; Auto review concern: ${reason}`,
++        info: {
++          name: APPROVAL_ERROR_NAME,
++          code: APPROVAL_REJECTED_CODE,
++          ...reason === undefined ? {} : { reason },
++        },
++      }
++    case 'cancelled':
++      // The pipeline materializes its canonical aborted-before-dispatch result.
++      return { kind: 'cancel' }
++    case 'unavailable':
++      return {
++        kind: 'deny',
++        reason: `tool "${exec.name}" requires approval, but no approval channel is available`,
++        info: { name: APPROVAL_ERROR_NAME, code: APPROVAL_UNAVAILABLE_CODE },
++      }
+   }
+ }
+ 
+@@ -766,14 +848,16 @@
+         if (isAborted(lifecycle.signal)) return { kind: 'cancel' }
+         if (!review.ok) return failed(exec, review.error)
+         const { decision } = review
+-        // The permission owner pins an approval policy into every published Session.
+-        if (decision.decision === 'deny' && ctx.approval.overrideOf(agent.session) === 'never') {
++        // The permission owner pins an approval policy into every published
++        // Session; a delegated child pins `never`. Use the same effective read
++        // as the approval service so a default-`never` deployment is automatic.
++        if (decision.decision === 'deny' && effectiveApprovalPolicy(ctx, agent) === 'never') {
+           return denied(exec, decision.reason)
+         }
+         const downstream = await next()
+         if (isAborted(lifecycle.signal)) return { kind: 'cancel' }
+         if (decision.decision === 'allow' || downstream.kind !== 'allow') return downstream
+-        return askUser(exec, decision.reason)
++        return askUser(ctx, agent, exec, signal, decision.reason)
+       } finally {
+         active.delete(completed.promise)
+         completed.resolve()
