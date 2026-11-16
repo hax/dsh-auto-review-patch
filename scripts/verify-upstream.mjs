@@ -7,10 +7,12 @@
  *    against the published DSH 0.2.2-rc.3 package by the recorded procedure in
  *    UPSTREAM.md);
  * 3. the stored patches apply in order to the pristine snapshot and reproduce
- *    `src/index.ts` byte-for-byte (pristine + 0001 + 0002 + 0003);
- * 4. patch 0001 still reproduces the committed Issue #3 source (`56a0252`) and
- *    patch 0002 the committed Issue #5 source (`5972f49`), so earlier behavior
- *    cannot drift;
+ *    `src/index.ts` byte-for-byte
+ *    (pristine + 0001 + 0002 + 0003 + 0004 + 0005);
+ * 4. patch 0001 still reproduces the committed Issue #3 source (`56a0252`),
+ *    patch 0002 the committed Issue #5 source (`5972f49`) and patch 0003 the
+ *    committed grant/unload race fix (`a25f516`), so earlier behavior cannot
+ *    drift; patch 0004 is frozen to its recorded patch and produced source;
  * 5. the patches only apply in their committed order and touch only the
  *    production source, while packaging files intended to mirror upstream stay
  *    byte-identical (`cordis.patch.yml`, locale JSON, icon, LICENSE).
@@ -30,12 +32,20 @@ const snapshot = join(root, 'upstream/dsh-v0.2.2-rc.3')
 const issue3Patch = join(root, 'patches/0001-return-concise-reviewer-denial-reasons.patch')
 /** Frozen Issue #5 patch, committed as `5972f49` before the grant/unload fix. */
 const issue5Patch = join(root, 'patches/0002-add-human-approval-timeout.patch')
-/** Current fix patch, applied after the two frozen patches. */
+/** Grant/unload race fix, applied after the two frozen patches. */
 const racePatch = join(root, 'patches/0003-fix-approval-grant-unload-race.patch')
-const patches = [issue3Patch, issue5Patch, racePatch]
-/** Commits the frozen patches must keep reproducing. */
+/** Load-time `FiberState` fix, applied after the race fix. Frozen. */
+const fiberPatch = join(root, 'patches/0004-inline-fiber-state-active.patch')
+/** Full-auto reviewer-denial setting, applied after the frozen 0004 patch. */
+const autoDenyPatch = join(root, 'patches/0005-add-auto-deny-reviewer-rejections.patch')
+const patches = [issue3Patch, issue5Patch, racePatch, fiberPatch, autoDenyPatch]
+/** Commits the stored patches must keep reproducing. */
 const ISSUE3_COMMIT = '56a0252'
 const ISSUE5_COMMIT = '5972f49'
+const RACE_COMMIT = 'a25f516'
+/** Frozen patch 0004 and the exact `src/index.ts` it must produce. */
+const FROZEN_FIBER_PATCH_SHA256 = '5ff7b1b6d9701709e4fb002ed81024e6189577df5df7dc09f874420c19d66691'
+const FROZEN_FIBER_SOURCE_SHA256 = '762d8e415fe37a5f04f38014cf7ea41b0699220bf6cafc04afc89fdfc53202f5'
 
 const failures = []
 let checks = 0
@@ -138,7 +148,7 @@ check('upstream snapshot is complete', () => {
 })
 
 // 2. Patches apply in order to a pristine copy and reproduce src/index.ts.
-check('pristine + 0001 + 0002 + 0003 reproduce src/index.ts byte-for-byte', () => {
+check('pristine + 0001 + 0002 + 0003 + 0004 + 0005 reproduce src/index.ts byte-for-byte', () => {
   withPristine((pristine) => {
     applyPatches(pristine)
     const applied = readFileSync(join(pristine, 'src/index.ts'))
@@ -167,6 +177,14 @@ check('patches apply only in their committed order', () => {
       () => execFileSync('git', ['apply', '--check', '-p1', racePatch], { cwd: pristine, stdio: 'pipe' }),
       'patch 0003 must not apply to the pristine snapshot',
     )
+    assertThrows(
+      () => execFileSync('git', ['apply', '--check', '-p1', fiberPatch], { cwd: pristine, stdio: 'pipe' }),
+      'patch 0004 must not apply to the pristine snapshot',
+    )
+    assertThrows(
+      () => execFileSync('git', ['apply', '--check', '-p1', autoDenyPatch], { cwd: pristine, stdio: 'pipe' }),
+      'patch 0005 must not apply to the pristine snapshot',
+    )
   })
 })
 
@@ -190,6 +208,36 @@ check('patch 0002 reproduces the committed Issue #5 source', () => {
     assert(
       readFileSync(join(pristine, 'src/index.ts')).equals(committed),
       `pristine + 0001 + 0002 differs from the committed ${ISSUE5_COMMIT} src/index.ts`,
+    )
+  })
+})
+
+check('patch 0003 reproduces the committed grant/unload race fix source', () => {
+  const committed = committedSource(RACE_COMMIT)
+  withPristine((pristine) => {
+    for (const patch of [issue3Patch, issue5Patch, racePatch]) {
+      execFileSync('git', ['apply', '-p1', '--whitespace=error-all', patch], { cwd: pristine })
+    }
+    assert(
+      readFileSync(join(pristine, 'src/index.ts')).equals(committed),
+      `pristine + 0001 + 0002 + 0003 differs from the committed ${RACE_COMMIT} src/index.ts`,
+    )
+  })
+})
+
+check('patch 0004 stays frozen and reproduces its recorded source', () => {
+  assert(
+    sha256(fiberPatch) === FROZEN_FIBER_PATCH_SHA256,
+    `patch 0004 is frozen (sha256 ${FROZEN_FIBER_PATCH_SHA256})`,
+  )
+  withPristine((pristine) => {
+    for (const patch of [issue3Patch, issue5Patch, racePatch, fiberPatch]) {
+      execFileSync('git', ['apply', '-p1', '--whitespace=error-all', patch], { cwd: pristine })
+    }
+    assert(
+      sha256(join(pristine, 'src/index.ts')) === FROZEN_FIBER_SOURCE_SHA256,
+      `pristine + 0001 + 0002 + 0003 + 0004 differs from the frozen source `
+      + `(sha256 ${FROZEN_FIBER_SOURCE_SHA256})`,
     )
   })
 })

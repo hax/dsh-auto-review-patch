@@ -132,7 +132,13 @@ type TrimmedPreToolDecision =
   }
 
 declare module '@deepseek-ai/cordis' {
-  export const FiberState: { readonly ACTIVE: string }
+  /**
+   * Cordis declares its fiber state as a `const enum`, so the shipped build
+   * inlines the member values (PENDING=0, LOADING=1, ACTIVE=2, FAILED=3,
+   * DISPOSED=4, UNLOADING=5) and exports no `FiberState` binding. There is
+   * therefore no importable value to declare here: the runtime state is the
+   * plain number the enum inlines to.
+   */
 
   export interface Context {
     effect(setup: () => Generator<unknown, void, unknown>, label?: string): unknown
@@ -146,7 +152,7 @@ declare module '@deepseek-ai/cordis' {
     readonly llm: { stream(options: TrimmedGenerateOptions): AsyncIterable<TrimmedStreamChunk> }
     readonly permissionPresets: TrimmedPermissionPresets
     readonly workingDirectory: { ensure(agent: TrimmedAgent, signal: AbortSignal): Promise<string> }
-    readonly root: { readonly fiber: { readonly state: string } }
+    readonly root: { readonly fiber: { readonly state: number } }
   }
 }
 
@@ -242,6 +248,7 @@ declare module '@deepseek-ai/schemastery' {
   }
   export interface SchemaFactory {
     number(): NumberSchema
+    boolean(): Schema<boolean>
     object(shape: Record<string, Schema<any>>): Schema<unknown>
   }
   const z: SchemaFactory

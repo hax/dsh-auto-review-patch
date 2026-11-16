@@ -16,7 +16,7 @@ declare module '@deepseek-ai/dsh-llm/types' {
 
 import type {} from '@deepseek-ai/dsh-tool-executor-ptc/types'
 import type {} from '@deepseek-ai/dsh-working-directory'
-import { FiberState, type Context } from '@deepseek-ai/cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-agent-instructions'
@@ -65,6 +65,17 @@ const APPROVAL_UNAVAILABLE_CODE = 'APPROVAL_UNAVAILABLE'
 const AUTO_REVIEW_APPROVAL_TIMEOUT_ERROR_NAME = 'AutoReviewApprovalTimeoutError'
 /** Structured error code persisted when a human approval wait times out. */
 const AUTO_REVIEW_APPROVAL_TIMEOUT_CODE = 'AUTO_REVIEW_APPROVAL_TIMEOUT'
+/**
+ * Cordis fiber state `ACTIVE` (`FiberState.ACTIVE`), taken from cordis 4.1.0's
+ * `FiberState` member order: PENDING, LOADING, ACTIVE, FAILED, DISPOSED,
+ * UNLOADING. Cordis declares that type as a `const enum`, so the shipped
+ * `@deepseek-ai/cordis` build inlines the member values and exports no
+ * `FiberState` binding at all: importing it makes this unbundled build fail at
+ * load time with "does not provide an export named 'FiberState'". The official
+ * bundled build compares against the same numeric literal, so the check keeps
+ * identical semantics; `FIBER_STATE_ACTIVE` is the fork's only use of the enum.
+ */
+const FIBER_STATE_ACTIVE = 2
 /**
  * Largest accepted human-response timeout: 24 hours. The value is a sane human
  * response bound, and the converted delay stays far below the largest delay a
@@ -190,17 +201,31 @@ export interface AutoReviewConfig {
    * question reads a changed value without remounting the integration.
    */
   readonly approvalTimeoutMinutes?: ConfigValue<number>
+  /**
+   * Whether a reviewer denial becomes the final automatic denial without
+   * asking a human. The Auto permission preset pins the official approval mode
+   * to `ask` and the GUI exposes no approval knob, so this setting gives the
+   * Auto review integration its own "full-auto rejection" switch.
+   *
+   * `true`: a reviewer `deny` maps directly to the same denial the automatic
+   * `never` mode writes (reviewer concern included, tool body never executed);
+   * no `approval.request()`, no human question and no timeout timer.
+   * `false` (default): every existing behavior is preserved. The field is
+   * volatile, so the next reviewed call reads a changed value.
+   */
+  readonly autoDenyReviewerRejections?: ConfigValue<boolean>
 }
 
 /**
- * Loader config schema. The only setting is the human-response timeout; it is
- * volatile so a settings or config update changes the next question's deadline
- * instead of requiring a plugin restart. The schema bounds the setting, and the
- * live value is still re-validated per question because a volatile ref can hold
- * an untrusted value at read time.
+ * Loader config schema. Both settings are volatile so a settings or config
+ * update changes the next reviewed call without remounting the integration.
+ * The schema bounds the minute setting, and the live value is still
+ * re-validated per question because a volatile ref can hold an untrusted value
+ * at read time.
  */
 export const Config = z.object({
   approvalTimeoutMinutes: z.number().min(0).max(MAX_APPROVAL_TIMEOUT_MINUTES).default(0).volatile(),
+  autoDenyReviewerRejections: z.boolean().default(false).volatile(),
 })
 
 /** Largest delay Node timers and abort deadlines represent without clamping. */
@@ -1145,8 +1170,17 @@ export function apply(ctx: Context, config: AutoReviewConfig = {}): void {
         // published Session; a delegated child pins the fully automatic
         // rejection mode. Resolve the same live mode as the approval service so
         // a default-never deployment rejects automatically.
+        //
+        // The Auto preset itself pins that mode to `ask` and the GUI exposes no
+        // approval knob, so `autoDenyReviewerRejections` gives this integration
+        // its own full-auto rejection switch: a reviewer denial becomes the
+        // same final automatic denial (concern included, body never executed)
+        // with no human question, no approval request and no timeout timer.
+        // The value is read live so a volatile config change applies to the
+        // next reviewed call.
         const approvalMode = resolveApprovalMode(ctx, agent)
-        if (decision.decision === 'deny' && approvalMode === 'never') {
+        const autoDenyReviewerRejections = readConfigValue(config.autoDenyReviewerRejections) === true
+        if (decision.decision === 'deny' && (approvalMode === 'never' || autoDenyReviewerRejections)) {
           return denied(exec, decision.reason)
         }
         const downstream = await next()
@@ -1173,7 +1207,7 @@ export function apply(ctx: Context, config: AutoReviewConfig = {}): void {
       accepting = false
       try {
         // Root unload begins before child cleanup; only live plugin removal changes Session policy.
-        if (ctx.root.fiber.state === FiberState.ACTIVE) {
+        if (ctx.root.fiber.state === FIBER_STATE_ACTIVE) {
           for (const session of ctx.sessions.list()) {
             if (permissionPresets.current(session) !== AUTO_PRESET) continue
             permissionPresets.set(session, 'danger-full-access')

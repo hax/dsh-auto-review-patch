@@ -15,11 +15,14 @@ Unofficial standalone fork of the official DSH package
 This repository is an **unofficial patch/fork**: it is not published and is
 not installed in the running profile by this task. It is based
 on the current DSH `0.2.2-rc.3` official source; exact upstream provenance is in
-[UPSTREAM.md](UPSTREAM.md). The production delta is stored as three independent,
+[UPSTREAM.md](UPSTREAM.md). The production delta is stored as five independent,
 ordered patches:
 `patches/0001-return-concise-reviewer-denial-reasons.patch` (Issue #3, frozen),
-`patches/0002-add-human-approval-timeout.patch` (Issue #5, frozen), and
-`patches/0003-fix-approval-grant-unload-race.patch` (grant/unload race fix).
+`patches/0002-add-human-approval-timeout.patch` (Issue #5, frozen),
+`patches/0003-fix-approval-grant-unload-race.patch` (grant/unload race fix),
+`patches/0004-inline-fiber-state-active.patch` (frozen load-time `FiberState`
+fix), and `patches/0005-add-auto-deny-reviewer-rejections.patch` (full-auto
+reviewer-denial switch).
 
 ## Behavior
 
@@ -74,7 +77,7 @@ existing approval seam, with the same audited `approval/asked` +
   lifecycle signal is re-read; an unload or caller cancellation that landed
   while the approval service was producing the outcome (including from a
   synchronous `approval/decided` observer) discards the grant instead, as
-  described in section 5. The approval audit pair is still written exactly once;
+  described in section 6. The approval audit pair is still written exactly once;
 - human **rejects** → the Agent receives the reviewer's concern in addition to
   the ordinary rejection:
 
@@ -94,9 +97,48 @@ existing approval seam, with the same audited `approval/asked` +
   `tool "<name>" requires approval, but no approval channel is available` denial
   (`ApprovalError` / `APPROVAL_UNAVAILABLE`).
 
-### 4. Minute-level human-response timeout (`approvalTimeoutMinutes`)
+### 4. Full-auto reviewer denial in the Auto preset (`autoDenyReviewerRejections`)
 
-The fork adds one Loader config setting:
+The Auto permission preset pins the official approval mode to `ask`
+(询问人类) and the Web GUI exposes no approval-policy knob, so this fork owns a
+second Loader config setting that turns a reviewer denial into the final
+automatic denial:
+
+| Field | Type | Default | Semantics |
+| --- | --- | --- | --- |
+| `autoDenyReviewerRejections` | boolean | `false` | `true`: a reviewer `deny` maps directly to the same automatic denial the `never` mode writes, without asking a human. `false`: every existing ask/never, direct-approval and timeout behavior is unchanged. |
+
+When it is `true` and the reviewer decision is `deny`:
+
+- the Agent receives the fixed automatic denial with the reviewer's concise
+  concern when present:
+
+  ```
+  Auto review rejected tool "<name>"; its body was not executed[: <decision.reason>]
+  ```
+
+  with `info: { name: 'AutoReviewDeniedError', code: 'AUTO_REVIEW_DENIED',
+  reason? }` — byte-identical to the `never`-mode denial from section 2;
+- **no human is asked**: there is no `approval.request()`, no
+  `approval/asked`/`approval/decided` audit pair and no `approvalTimeoutMinutes`
+  timer;
+- the tool body never executes, and downstream `tools/pre-execute` listeners are
+  not consulted (the denial returns before `next()`, exactly like the `never`
+  path);
+- the switch only reacts to reviewer `deny` decisions: reviewer **allow** still
+  runs the normal pipeline (downstream gates, guards, dispatch), and technical
+  reviewer failures still use `failed()` / `AUTO_REVIEW_FAILED` unchanged. Risk
+  classification and the allow/deny decision itself are untouched.
+
+The field is declared in the exported Loader schema (`Config`) with
+`schemastery`'s `.volatile()` and read **once per reviewed call**, so a config
+update applies to the next call without remounting the integration. Only a
+literal `true` enables it; `false`, a missing value, or an unreadable live value
+keeps the existing behavior.
+
+### 5. Minute-level human-response timeout (`approvalTimeoutMinutes`)
+
+The fork adds this Loader config setting:
 
 | Field | Type | Default | Range | Semantics |
 | --- | --- | --- | --- | --- |
@@ -144,21 +186,16 @@ How the deadline works:
 - the existing approval failure containment is unchanged: an approval request
   that throws still fails the call exactly as before and the timer is cleared.
 
-Configure it in the profile patch alongside the inserted plugin row:
-
-```yaml
-- id: auto-review
-  name: "@deepseek-ai/dsh-experimental-auto-review"
-  config:
-    approvalTimeoutMinutes: 5
-```
+Both Loader settings (`approvalTimeoutMinutes` and
+`autoDenyReviewerRejections`) are configured on the Auto review bundle row; see
+[Where to configure the settings](#where-to-configure-the-settings).
 
 Scope limit: the deadline belongs to the plugin's own direct approval question.
 A downstream `ask` gate produced by another pre-execute listener (after a
 reviewer allow, or outside the reviewer-denial path) is still resolved by
 `ToolsPipeline`'s private `serviceAsk()` and is **not** timed by this patch.
 
-### 5. Grant-versus-unload race (final-review fix)
+### 6. Grant-versus-unload race (final-review fix)
 
 `ApprovalService.request()` appends its durable `approval/decided` audit event
 before it returns the outcome, and `Session.append()` notifies observers
@@ -214,7 +251,43 @@ The minimal reliable fix is therefore to call the **public**
 - keeps the `never` policy gate inside `ApprovalService` authoritative;
 - puts this question — and only this question — on the #5 minute-level deadline:
   the request signal fuses the call lifetime, the integration disposal signal
-  and, when configured, the human-response deadline.
+  and, when configured, the human-response deadline;
+- is skipped entirely when `autoDenyReviewerRejections` is `true`: that setting
+  returns the automatic denial before this seam (see section 4), so a
+  full-auto deployment never asks a human and never arms a deadline.
+
+## Where to configure the settings
+
+Both settings are ordinary Loader `Config` fields of the Auto review bundle, so
+they are set on the `auto-review` row in the active profile's Cordis patch.
+
+- **Web GUI:** the sidebar **Plugins** page edits configuration only for
+  plugins that ship their own configuration page (the `auto-review-model` fork
+  is an example of a plugin that ships one). This Host-only Auto review fork
+  ships **no client page**, and the shipped Web client does not
+  auto-generate forms from a bundle's `Config` schema
+  (`@deepseek-ai/dsh-settings` supports such forms, but no shipped client builds
+  pages from the schema yet). The **Plugins** page and **Settings → Built-in
+  plugins** therefore list the Auto review bundle and its inventory, while its
+  two config values are edited in the profile patch below.
+- **Profile patch (the supported path):** edit the active profile's
+  `cordis.patch.yml` — on Desktop
+  `~/.dsh/profiles/<profile>/cordis.patch.yml` — and override the installed
+  bundle row with a `config` block:
+
+  ```yaml
+  - id: auto-review
+    name: "@deepseek-ai/dsh-experimental-auto-review"
+    config:
+      approvalTimeoutMinutes: 5
+      autoDenyReviewerRejections: true
+  ```
+
+  Both fields are `volatile`, so once the profile change is applied
+  (`config-editor`/HMR), the next reviewed call reads the new values without
+  remounting the integration; without HMR the change applies after a restart.
+  Omitting a field keeps its schema default (`approvalTimeoutMinutes: 0`,
+  `autoDenyReviewerRejections: false`).
 
 ## Upstream drift risk
 
@@ -241,13 +314,20 @@ and the upstream ask-path tests assert only `the user rejected tool "<name>"`.
 Porting this patch upstream requires updating those assertions together with
 the new regression tests in this repository.
 
-The #5 additions are fork-only as well: the official plugin exports no `Config`
-schema, so `approvalTimeoutMinutes`, `AutoReviewApprovalTimeoutError` and
+The #5 and full-auto-denial additions are fork-only as well: the official
+plugin exports no `Config` schema, so `approvalTimeoutMinutes`,
+`autoDenyReviewerRejections`, `AutoReviewApprovalTimeoutError` and
 `AUTO_REVIEW_APPROVAL_TIMEOUT` have no upstream counterpart. This fork therefore
-depends on `@deepseek-ai/schemastery` (`~3.19.0`, the version upstream DSH
-packages declare) for its Loader config schema; official Auto review does not.
-The upstream spec does not cover a human-response timeout at all, so the
-regression tests in this repository are its only automated coverage.
+declares `@deepseek-ai/schemastery` (`~3.19.0`, the version upstream DSH
+packages declare) as a **peer dependency** for its Loader config schema; official
+Auto review does not need it. A peer, not a dependency: DSH installs this fork
+as a `link:` into the profile, and pnpm does not install a linked package's own
+`dependencies`, so a plain dependency is never resolvable at runtime — the DSH
+loader only routes a bare import to the installation's copy when the importing
+package declares it in `peerDependencies` (see the note below).
+The upstream spec does not cover a human-response timeout or the full-auto
+reviewer-denial switch at all, so the regression tests in this repository are
+their only automated coverage.
 
 The #0003 fix additionally relies on the documented `Session.append()` behavior
 of notifying `session/event` observers synchronously after the log push; that is
@@ -255,23 +335,67 @@ what lets an observer unload the integration between the durable approval grant
 and its mapping. If a future DSH release defers observer notification, revisit
 the race window and its regression tests.
 
+### Load-time import compatibility with the shipped DSH build (fork-only)
+
+The fork is an **unbundled** `tsc` build, while the official package ships a
+bundle. Two upstream source imports therefore cannot be taken verbatim, and both
+failure modes only appear when the plugin is really loaded by the running app —
+never in the offline test suite:
+
+1. **`@deepseek-ai/schemastery`** (added by Issue #5) must be a
+   `peerDependencies` entry, not a `dependencies` entry. DSH links this fork into
+   the profile (`link:`), and pnpm does not install a linked package's own
+   dependencies; the runtime resolver (`dsh-app-boot` `routeLinked`) only routes
+   a bare import to the installation's copy when the linked package declares that
+   name as a peer. As a `dependency` the import fails with
+   `Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@deepseek-ai/schemastery'`.
+2. **`FiberState`** must not be imported from `@deepseek-ai/cordis` (patch 0004).
+   Cordis declares it as a `const enum`, so the shipped `@deepseek-ai/cordis`
+   build inlines the member values and exports no `FiberState` binding at all;
+   the official bundle therefore compares `ctx.root.fiber.state` against the
+   inlined literal `2`. The fork does the same through the documented
+   `FIBER_STATE_ACTIVE` constant. As a bare import it fails at load time with
+   `The requested module '@deepseek-ai/cordis' does not provide an export named
+   'FiberState'`.
+
+Both are properties of the installed runtime, not of the upstream source, so the
+`types/` declarations were corrected to state them explicitly
+(`ctx.root.fiber.state` is a number; no importable `FiberState`) and the local
+cordis test double carries the numeric member order instead of a string.
+
+Verified against the installed build with the runtime's own profile resolver:
+
+```sh
+DSH_HOME=<scratch-home> dsh --profile verify --dump-config-schema
+```
+
+Importing the fork's `lib/index.js` through a `link:` profile entry (which is
+exactly what the app does at startup) now succeeds, and the dumped JSON Schema
+contains the volatile `approvalTimeoutMinutes` field the plugin exports. Every
+other runtime import (`BlockAssembler`, `deepFreeze`, `AUTO_PRESET`,
+`RUN_CODE_NAME`, the schemastery default export) was checked to exist in the
+installed packages.
+
 ## Layout
 
 ```
-src/index.ts                 patched production source (real official code + three minimal patches)
+src/index.ts                 patched production source (real official code + five minimal patches)
 src/locales.ts               verbatim upstream production source
 types/                       trimmed 0.2.2-rc.3 ambient declarations for offline typecheck
 upstream/dsh-v0.2.2-rc.3/    pristine upstream snapshot + SHA256SUMS
 patches/0001-*.patch         Issue #3 denial-reason delta vs the pristine snapshot (frozen)
 patches/0002-*.patch         Issue #5 human-response timeout delta, applied after 0001 (frozen)
 patches/0003-*.patch         grant-versus-unload race fix, applied after 0002
+patches/0004-*.patch         inlined `FiberState.ACTIVE` literal, applied after 0003 (frozen)
+patches/0005-*.patch         full-auto reviewer-denial switch, applied after 0004
 tests/harness/               deterministic fake Cordis context / Session / tool pipeline
 tests/stubs/                 test doubles for the six runtime @deepseek-ai imports
 tests/denial-feedback.test.mjs    never-mode denial, failure, CoT and body-suppression tests
 tests/ask-approval.test.mjs       approval mapping/audit/approval-mode/teardown tests
 tests/approval-timeout.test.mjs   timeout config, deadline, late-answer, cancellation and cleanup tests
 tests/unload-race.test.mjs        grant-versus-unload/caller-cancel race tests
-scripts/make-patch.mjs       regenerates patches/0003 from the pristine snapshot + frozen 0001/0002
+tests/auto-deny.test.mjs          full-auto reviewer-denial setting tests
+scripts/make-patch.mjs       rebuilds 0003 from commit a25f516 and 0005 from the frozen 0001-0004 source (never rewrites frozen 0004)
 scripts/verify-upstream.mjs  offline provenance and ordered patch-reproduction checks
 ```
 
@@ -286,11 +410,16 @@ production source (or the built `lib/` artifact) against them.
 
 Requirements: Node.js ≥ 22.18 (native TypeScript stripping for the source
 tests). The only devDependency is TypeScript 5.7.3. The package declares one
-runtime dependency, `@deepseek-ai/schemastery` (`~3.19.0`), for the Loader
-config schema added by Issue #5. This offline workflow does not install it: the
-tests resolve a local test double and typecheck uses trimmed ambient
-declarations, so a real installation must resolve that dependency from the DSH
-package tree or a registry.
+runtime peer, `@deepseek-ai/schemastery` (`~3.19.0`), for the Loader config
+schema added by Issue #5. It must be a peer declaration, not a dependency: the
+profile installs this package with a `link:` specifier, and a linked package's
+own `dependencies` are not installed by pnpm, while the DSH runtime resolver
+(`dsh-app-boot` `routeLinked`) only routes a bare import to the installation's
+copy of a package when the linked importer lists it in `peerDependencies`. This
+offline workflow does not install it at all: the tests resolve a local test
+double and typecheck uses trimmed ambient declarations, so a real installation
+resolves it from the DSH package tree (verified: the installation scope exposes
+`@deepseek-ai/schemastery@3.19.0`).
 
 ### Offline dev-dependency bootstrap
 
@@ -311,7 +440,7 @@ npm test                   # run tests against src/ via Node's TypeScript stripp
 npm run build              # emit lib/index.js + lib/locales.js (+ .d.ts)
 npm run test:lib           # run the same tests against the built lib/ artifact
 npm run check              # node --check on built JS and the verify script
-npm run verify:upstream    # snapshot hashes; pristine + 0001 + 0002 + 0003 == src/index.ts; frozen 0001/0002 == commits 56a0252/5972f49
+npm run verify:upstream    # snapshot hashes; pristine + 0001..0005 == src/index.ts; 0001/0002/0003 == commits 56a0252/5972f49/a25f516; 0004 frozen
 npm run verify             # all of the above, from an empty node_modules
 ```
 
@@ -319,12 +448,14 @@ On a networked machine a plain `npm install` remains available; the vendored
 tarball is only the deterministic offline path for the current no-install
 verification environment.
 
-Current status in this working tree: `typecheck` clean, 46/46 tests pass in
-both source and `lib/` modes (21 Issue #3 + 21 Issue #5 + 4 grant/unload race),
-builds and syntax checks pass, 12/12 offline provenance checks pass (pristine +
-0001 + 0002 + 0003 reconstruct `src/index.ts` byte-for-byte, and the frozen
-patches still reproduce the committed Issue #3 source at `56a0252` and Issue #5
-source at `5972f49`), and `git diff --check` is clean. This was re-verified from
+Current status in this working tree: `typecheck` clean, 57/57 tests pass in
+both source and `lib/` modes (21 Issue #3 + 21 Issue #5 + 4 grant/unload race +
+11 full-auto denial), builds and syntax checks pass, 14/14 offline provenance
+checks pass (pristine + 0001 + 0002 + 0003 + 0004 + 0005 reconstruct
+`src/index.ts` byte-for-byte, the stored patches still reproduce the committed
+Issue #3 source at `56a0252`, Issue #5 source at `5972f49` and grant/unload race
+fix at `a25f516`, and frozen patch 0004 still produces its recorded source), and
+`git diff --check` is clean. This was re-verified from
 an empty `node_modules` in a plain shell with no `tsc` on `PATH`: `npm run
 verify` bootstraps the vendored TypeScript offline and completes in a few
 seconds, and `npm run typecheck` / `npm run build` work standalone the same way.
@@ -340,8 +471,8 @@ seconds, and `npm run typecheck` / `npm run build` work standalone the same way.
   The Loader delivery of a volatile `Config` is modeled with a local
   `schemastery` test double and trimmed declarations; real Loader config
   parsing/volatile update was not exercised without an install, and the runtime
-  `@deepseek-ai/schemastery` dependency is not installed by this no-install
-  workflow.
+  `@deepseek-ai/schemastery` peer is not installed by this no-install workflow
+  (the DSH runtime supplies it from the installation scope).
 - Human-response timeouts run against real timers but sub-second deadlines
   (fractional minutes such as `0.001` = 60 ms, bounded by a per-test timeout);
   no test waits for minutes, and no multi-minute wall-clock behavior is
@@ -353,6 +484,12 @@ seconds, and `npm run typecheck` / `npm run build` work standalone the same way.
   synchronous observer notification with the fake Session's
   `observeAppends`; a real Session observer running a real plugin unload was not
   exercised without an install.
+- The full-auto denial setting is tested through the standalone harness only.
+  The GUI conclusion in [Where to configure the settings](#where-to-configure-the-settings)
+  comes from the installed DSH documentation and packages (`dsh-client-ui-plugin-manager`,
+  `dsh-settings`): no shipped Web client auto-generates a form from a bundle
+  `Config` schema yet, and this Host-only fork ships no client page. A live
+  Plugins/Settings UI and a real profile-patch write were not exercised here.
 - No live DSH route, real `ApprovalService` or real model was exercised: this
   task does not install the fork. Real-process verification belongs to the
   separate installation/verification workstream.
@@ -366,6 +503,9 @@ seconds, and `npm run typecheck` / `npm run build` work standalone the same way.
   concise `decision.reason` is the only additional text forwarded.
 - No timeout for approval questions this plugin does not ask itself (the
   pipeline's own downstream `ask` gate).
+- No Client/Settings page for the two Loader settings; this fork stays
+  Host-only and its config is edited through the profile patch (see
+  [Where to configure the settings](#where-to-configure-the-settings)).
 
 ## License
 

@@ -52,6 +52,7 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/schemastery": "~3.19.0",
     "@deepseek-ai/dsh-agent": "0.2.2-rc.3",
     "@deepseek-ai/dsh-agent-instructions": "0.2.2-rc.3",
     "@deepseek-ai/dsh-llm": "0.2.2-rc.3",
@@ -62,9 +63,6 @@
     "@deepseek-ai/dsh-user-approval": "0.2.2-rc.3",
     "@deepseek-ai/dsh-util-values": "0.2.2-rc.3",
     "@deepseek-ai/dsh-working-directory": "0.2.2-rc.3"
-  },
-  "dependencies": {
-    "@deepseek-ai/schemastery": "~3.19.0"
   },
   "devDependencies": {
     "typescript": "5.7.3"

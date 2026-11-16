@@ -1,0 +1,53 @@
+# Fork patch 0004 for @deepseek-ai/dsh-experimental-auto-review 0.2.2-rc.3
+# Removes the load-time import of cordis's `FiberState`, which the shipped
+# @deepseek-ai/cordis build does not export because cordis declares that type as
+# a `const enum` and inlines its member values. The fork compares against the
+# same inlined literal (ACTIVE = 2) that the official bundled build uses.
+# Applies AFTER patches/0003-fix-approval-grant-unload-race.patch; together the
+# four patches reproduce this fork's src/index.ts byte-for-byte.
+# Upstream: deepseek-ai/deepseek-harness tag dsh-v0.2.2-rc.3
+#           commit 38a6a5c965aa99ab525161efb7cc5cf1fe62fced
+# Path:     packages/experimental/auto-review/src/index.ts
+# Apply:    git apply -p1 patches/0001-return-concise-reviewer-denial-reasons.patch
+#           git apply -p1 patches/0002-add-human-approval-timeout.patch
+#           git apply -p1 patches/0003-fix-approval-grant-unload-race.patch
+#           git apply -p1 patches/0004-inline-fiber-state-active.patch
+#           (or: npm run verify:upstream checks all four patches reproduce this fork's src/index.ts)
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -16,7 +16,7 @@
+ 
+ import type {} from '@deepseek-ai/dsh-tool-executor-ptc/types'
+ import type {} from '@deepseek-ai/dsh-working-directory'
+-import { FiberState, type Context } from '@deepseek-ai/cordis'
++import type { Context } from '@deepseek-ai/cordis'
+ import type { Agent } from '@deepseek-ai/dsh-agent'
+ import z from '@deepseek-ai/schemastery'
+ import type {} from '@deepseek-ai/dsh-agent-instructions'
+@@ -66,6 +66,17 @@
+ /** Structured error code persisted when a human approval wait times out. */
+ const AUTO_REVIEW_APPROVAL_TIMEOUT_CODE = 'AUTO_REVIEW_APPROVAL_TIMEOUT'
+ /**
++ * Cordis fiber state `ACTIVE` (`FiberState.ACTIVE`), taken from cordis 4.1.0's
++ * `FiberState` member order: PENDING, LOADING, ACTIVE, FAILED, DISPOSED,
++ * UNLOADING. Cordis declares that type as a `const enum`, so the shipped
++ * `@deepseek-ai/cordis` build inlines the member values and exports no
++ * `FiberState` binding at all: importing it makes this unbundled build fail at
++ * load time with "does not provide an export named 'FiberState'". The official
++ * bundled build compares against the same numeric literal, so the check keeps
++ * identical semantics; `FIBER_STATE_ACTIVE` is the fork's only use of the enum.
++ */
++const FIBER_STATE_ACTIVE = 2
++/**
+  * Largest accepted human-response timeout: 24 hours. The value is a sane human
+  * response bound, and the converted delay stays far below the largest delay a
+  * Node timer and `AbortSignal` deadline represent without clamping.
+@@ -1173,7 +1184,7 @@
+       accepting = false
+       try {
+         // Root unload begins before child cleanup; only live plugin removal changes Session policy.
+-        if (ctx.root.fiber.state === FiberState.ACTIVE) {
++        if (ctx.root.fiber.state === FIBER_STATE_ACTIVE) {
+           for (const session of ctx.sessions.list()) {
+             if (permissionPresets.current(session) !== AUTO_PRESET) continue
+             permissionPresets.set(session, 'danger-full-access')

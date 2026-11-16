@@ -41,6 +41,10 @@ const z = {
   number() {
     return new Schema('number', {})
   },
+  /** Build one boolean schema. */
+  boolean() {
+    return new Schema('boolean', {})
+  },
   /** Build one object schema from a field map. */
   object(shape) {
     return new Schema('object', {}, shape)
