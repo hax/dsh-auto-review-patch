@@ -15,10 +15,11 @@ Unofficial standalone fork of the official DSH package
 This repository is an **unofficial patch/fork**: it is not published and is
 not installed in the running profile by this task. It is based
 on the current DSH `0.2.2-rc.3` official source; exact upstream provenance is in
-[UPSTREAM.md](UPSTREAM.md). The production delta is stored as two independent,
-ordered patches: `patches/0001-return-concise-reviewer-denial-reasons.patch`
-(Issue #3, frozen) and `patches/0002-add-human-approval-timeout.patch`
-(Issue #5).
+[UPSTREAM.md](UPSTREAM.md). The production delta is stored as three independent,
+ordered patches:
+`patches/0001-return-concise-reviewer-denial-reasons.patch` (Issue #3, frozen),
+`patches/0002-add-human-approval-timeout.patch` (Issue #5, frozen), and
+`patches/0003-fix-approval-grant-unload-race.patch` (grant/unload race fix).
 
 ## Behavior
 
@@ -68,7 +69,12 @@ existing approval seam, with the same audited `approval/asked` +
 `approval/decided` pair, the same answerer routing and the same
 `displayReason` localization:
 
-- human **allows** → the tool executes normally (after the pipeline's guards);
+- human **allows** → the tool executes normally (after the pipeline's guards).
+  Before that `allowed-once` grant is accepted, the fused call + integration
+  lifecycle signal is re-read; an unload or caller cancellation that landed
+  while the approval service was producing the outcome (including from a
+  synchronous `approval/decided` observer) discards the grant instead, as
+  described in section 5. The approval audit pair is still written exactly once;
 - human **rejects** → the Agent receives the reviewer's concern in addition to
   the ordinary rejection:
 
@@ -152,6 +158,35 @@ A downstream `ask` gate produced by another pre-execute listener (after a
 reviewer allow, or outside the reviewer-denial path) is still resolved by
 `ToolsPipeline`'s private `serviceAsk()` and is **not** timed by this patch.
 
+### 5. Grant-versus-unload race (final-review fix)
+
+`ApprovalService.request()` appends its durable `approval/decided` audit event
+before it returns the outcome, and `Session.append()` notifies observers
+**synchronously**. An observer can therefore unload this integration (or abort
+the caller) after an `allowed-once` grant is durable but before the plugin maps
+that outcome. Without a re-check the plugin could return `allow` for a body that
+would then dispatch after unload: the pipeline only sees the tool call's own
+signal, not this integration's disposal signal.
+
+The fix re-reads signals at every point where an approval outcome is accepted:
+
+- after **every** approval await — both the `approvalTimeoutMinutes = 0`
+  direct-request path and the deadline path — the fused
+  `call signal + integration lifecycle signal` is re-read before an outcome is
+  mapped; a caller cancellation or plugin unload returns the canonical
+  `tool call aborted before dispatch` cancellation and discards even an
+  `allowed-once` grant. A lone elapsed deadline still maps to the #5 timeout
+  instead of a cancellation;
+- after `askUser()` returns and before the pre-execute listener returns to the
+  pipeline, the integration lifecycle is re-read once more, closing the window
+  between accepting the grant and handing it to the pipeline.
+
+The approval audit remains exactly the one `approval/asked` +
+`approval/decided` pair the service wrote (for example `allowed-once`), the
+other outcome mappings are unchanged, and the tool body never executes. The
+regression tests trigger disposal and caller aborts from a synchronous
+`approval/decided` observer in both the timeout-less and deadline paths.
+
 ### Why the plugin calls `approval.request()` itself
 
 `ToolsPipeline.prepare()` applies the `tools/pre-execute` waterfall **first**
@@ -214,21 +249,29 @@ packages declare) for its Loader config schema; official Auto review does not.
 The upstream spec does not cover a human-response timeout at all, so the
 regression tests in this repository are its only automated coverage.
 
+The #0003 fix additionally relies on the documented `Session.append()` behavior
+of notifying `session/event` observers synchronously after the log push; that is
+what lets an observer unload the integration between the durable approval grant
+and its mapping. If a future DSH release defers observer notification, revisit
+the race window and its regression tests.
+
 ## Layout
 
 ```
-src/index.ts                 patched production source (real official code + two minimal patches)
+src/index.ts                 patched production source (real official code + three minimal patches)
 src/locales.ts               verbatim upstream production source
 types/                       trimmed 0.2.2-rc.3 ambient declarations for offline typecheck
 upstream/dsh-v0.2.2-rc.3/    pristine upstream snapshot + SHA256SUMS
 patches/0001-*.patch         Issue #3 denial-reason delta vs the pristine snapshot (frozen)
-patches/0002-*.patch         Issue #5 human-response timeout delta, applied after 0001
+patches/0002-*.patch         Issue #5 human-response timeout delta, applied after 0001 (frozen)
+patches/0003-*.patch         grant-versus-unload race fix, applied after 0002
 tests/harness/               deterministic fake Cordis context / Session / tool pipeline
 tests/stubs/                 test doubles for the six runtime @deepseek-ai imports
 tests/denial-feedback.test.mjs    never-mode denial, failure, CoT and body-suppression tests
 tests/ask-approval.test.mjs       approval mapping/audit/approval-mode/teardown tests
 tests/approval-timeout.test.mjs   timeout config, deadline, late-answer, cancellation and cleanup tests
-scripts/make-patch.mjs       regenerates patches/0002 from the pristine snapshot + patch 0001
+tests/unload-race.test.mjs        grant-versus-unload/caller-cancel race tests
+scripts/make-patch.mjs       regenerates patches/0003 from the pristine snapshot + frozen 0001/0002
 scripts/verify-upstream.mjs  offline provenance and ordered patch-reproduction checks
 ```
 
@@ -268,7 +311,7 @@ npm test                   # run tests against src/ via Node's TypeScript stripp
 npm run build              # emit lib/index.js + lib/locales.js (+ .d.ts)
 npm run test:lib           # run the same tests against the built lib/ artifact
 npm run check              # node --check on built JS and the verify script
-npm run verify:upstream    # snapshot hashes; pristine + 0001 + 0002 == src/index.ts; 0001 == commit 56a0252
+npm run verify:upstream    # snapshot hashes; pristine + 0001 + 0002 + 0003 == src/index.ts; frozen 0001/0002 == commits 56a0252/5972f49
 npm run verify             # all of the above, from an empty node_modules
 ```
 
@@ -276,15 +319,15 @@ On a networked machine a plain `npm install` remains available; the vendored
 tarball is only the deterministic offline path for the current no-install
 verification environment.
 
-Current status in this working tree: `typecheck` clean, 42/42 tests pass in
-both source and `lib/` modes (21 Issue #3 + 21 Issue #5), builds and syntax
-checks pass, 10/10 offline provenance checks pass (pristine + 0001 + 0002
-reconstruct `src/index.ts` byte-for-byte, and 0001 still reproduces the
-committed Issue #3 source at `56a0252`), and `git diff --check` is clean. This
-was re-verified from an empty `node_modules` in a plain shell with no `tsc` on
-`PATH`: `npm run verify` bootstraps the vendored TypeScript offline and
-completes in a few seconds, and `npm run typecheck` / `npm run build` work
-standalone the same way.
+Current status in this working tree: `typecheck` clean, 46/46 tests pass in
+both source and `lib/` modes (21 Issue #3 + 21 Issue #5 + 4 grant/unload race),
+builds and syntax checks pass, 12/12 offline provenance checks pass (pristine +
+0001 + 0002 + 0003 reconstruct `src/index.ts` byte-for-byte, and the frozen
+patches still reproduce the committed Issue #3 source at `56a0252` and Issue #5
+source at `5972f49`), and `git diff --check` is clean. This was re-verified from
+an empty `node_modules` in a plain shell with no `tsc` on `PATH`: `npm run
+verify` bootstraps the vendored TypeScript offline and completes in a few
+seconds, and `npm run typecheck` / `npm run build` work standalone the same way.
 
 ### Coverage limits in this standalone fork
 
@@ -306,6 +349,10 @@ standalone the same way.
 - Only the plugin's own direct approval question is timed; a downstream `ask`
   gate resolved by `ToolsPipeline`'s private `serviceAsk()` is out of scope (see
   the behavior section).
+- The grant-versus-unload race tests model the real `Session.append()`
+  synchronous observer notification with the fake Session's
+  `observeAppends`; a real Session observer running a real plugin unload was not
+  exercised without an install.
 - No live DSH route, real `ApprovalService` or real model was exercised: this
   task does not install the fork. Real-process verification belongs to the
   separate installation/verification workstream.

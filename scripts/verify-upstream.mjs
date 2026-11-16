@@ -7,12 +7,13 @@
  *    against the published DSH 0.2.2-rc.3 package by the recorded procedure in
  *    UPSTREAM.md);
  * 3. the stored patches apply in order to the pristine snapshot and reproduce
- *    `src/index.ts` byte-for-byte (pristine + 0001 + 0002);
- * 4. patch 0001 still reproduces the committed Issue #3 source (git commit
- *    `56a0252`), so the preserved denial-feedback behavior cannot drift;
- * 5. the patches touch only the production source, and packaging files
- *    intended to mirror upstream stay byte-identical (`cordis.patch.yml`,
- *    locale JSON, icon, LICENSE).
+ *    `src/index.ts` byte-for-byte (pristine + 0001 + 0002 + 0003);
+ * 4. patch 0001 still reproduces the committed Issue #3 source (`56a0252`) and
+ *    patch 0002 the committed Issue #5 source (`5972f49`), so earlier behavior
+ *    cannot drift;
+ * 5. the patches only apply in their committed order and touch only the
+ *    production source, while packaging files intended to mirror upstream stay
+ *    byte-identical (`cordis.patch.yml`, locale JSON, icon, LICENSE).
  *
  * No network access or package installation is required.
  */
@@ -27,11 +28,14 @@ const root = fileURLToPath(new URL('..', import.meta.url))
 const snapshot = join(root, 'upstream/dsh-v0.2.2-rc.3')
 /** Frozen Issue #3 patch, committed as `56a0252` before the timeout patch. */
 const issue3Patch = join(root, 'patches/0001-return-concise-reviewer-denial-reasons.patch')
-/** Issue #5 patch, applied after {@link issue3Patch}. */
-const timeoutPatch = join(root, 'patches/0002-add-human-approval-timeout.patch')
-const patches = [issue3Patch, timeoutPatch]
-/** Commit that must stay reproducible from the pristine snapshot plus 0001. */
+/** Frozen Issue #5 patch, committed as `5972f49` before the grant/unload fix. */
+const issue5Patch = join(root, 'patches/0002-add-human-approval-timeout.patch')
+/** Current fix patch, applied after the two frozen patches. */
+const racePatch = join(root, 'patches/0003-fix-approval-grant-unload-race.patch')
+const patches = [issue3Patch, issue5Patch, racePatch]
+/** Commits the frozen patches must keep reproducing. */
 const ISSUE3_COMMIT = '56a0252'
+const ISSUE5_COMMIT = '5972f49'
 
 const failures = []
 let checks = 0
@@ -65,6 +69,28 @@ function assert(condition, message) {
   if (!condition) throw new Error(message)
 }
 
+/** Assert that one callback throws, for order-dependency checks. */
+function assertThrows(fn, message) {
+  try {
+    fn()
+  } catch {
+    return
+  }
+  throw new Error(message)
+}
+
+/** Read one committed source file; a missing commit is a hard failure. */
+function committedSource(commit) {
+  try {
+    return execFileSync('git', ['show', `${commit}:src/index.ts`], { cwd: root })
+  } catch (error) {
+    throw new Error(
+      `cannot read ${commit}:src/index.ts from git; the preserved commit must stay reachable `
+      + `(${error instanceof Error ? error.message : String(error)})`,
+    )
+  }
+}
+
 /** Run one callback against a throwaway pristine copy of the snapshot. */
 function withPristine(fn) {
   const temporary = mkdtempSync(join(tmpdir(), 'auto-review-verify-'))
@@ -74,6 +100,13 @@ function withPristine(fn) {
     return fn(pristine)
   } finally {
     rmSync(temporary, { recursive: true, force: true })
+  }
+}
+
+/** Apply each patch in order to the pristine copy. */
+function applyPatches(pristine) {
+  for (const patch of patches) {
+    execFileSync('git', ['apply', '-p1', '--whitespace=error-all', patch], { cwd: pristine })
   }
 }
 
@@ -105,11 +138,9 @@ check('upstream snapshot is complete', () => {
 })
 
 // 2. Patches apply in order to a pristine copy and reproduce src/index.ts.
-check('pristine + 0001 + 0002 reproduce src/index.ts byte-for-byte', () => {
+check('pristine + 0001 + 0002 + 0003 reproduce src/index.ts byte-for-byte', () => {
   withPristine((pristine) => {
-    for (const patch of patches) {
-      execFileSync('git', ['apply', '-p1', '--whitespace=error-all', patch], { cwd: pristine })
-    }
+    applyPatches(pristine)
     const applied = readFileSync(join(pristine, 'src/index.ts'))
     const current = readFileSync(join(root, 'src/index.ts'))
     assert(applied.equals(current), 'patched upstream source differs from src/index.ts')
@@ -126,21 +157,39 @@ check('stored patches have no whitespace errors and apply in sequence', () => {
   })
 })
 
-check('patch 0001 reproduces the committed Issue #3 source', () => {
-  let committed
-  try {
-    committed = execFileSync('git', ['show', `${ISSUE3_COMMIT}:src/index.ts`], { cwd: root })
-  } catch (error) {
-    throw new Error(
-      `cannot read ${ISSUE3_COMMIT}:src/index.ts from git; the preserved Issue #3 commit must stay reachable `
-      + `(${error instanceof Error ? error.message : String(error)})`,
+check('patches apply only in their committed order', () => {
+  withPristine((pristine) => {
+    assertThrows(
+      () => execFileSync('git', ['apply', '--check', '-p1', issue5Patch], { cwd: pristine, stdio: 'pipe' }),
+      'patch 0002 must not apply to the pristine snapshot',
     )
-  }
+    assertThrows(
+      () => execFileSync('git', ['apply', '--check', '-p1', racePatch], { cwd: pristine, stdio: 'pipe' }),
+      'patch 0003 must not apply to the pristine snapshot',
+    )
+  })
+})
+
+check('patch 0001 reproduces the committed Issue #3 source', () => {
+  const committed = committedSource(ISSUE3_COMMIT)
   withPristine((pristine) => {
     execFileSync('git', ['apply', '-p1', '--whitespace=error-all', issue3Patch], { cwd: pristine })
     assert(
       readFileSync(join(pristine, 'src/index.ts')).equals(committed),
       `pristine + 0001 differs from the committed ${ISSUE3_COMMIT} src/index.ts`,
+    )
+  })
+})
+
+check('patch 0002 reproduces the committed Issue #5 source', () => {
+  const committed = committedSource(ISSUE5_COMMIT)
+  withPristine((pristine) => {
+    for (const patch of [issue3Patch, issue5Patch]) {
+      execFileSync('git', ['apply', '-p1', '--whitespace=error-all', patch], { cwd: pristine })
+    }
+    assert(
+      readFileSync(join(pristine, 'src/index.ts')).equals(committed),
+      `pristine + 0001 + 0002 differs from the committed ${ISSUE5_COMMIT} src/index.ts`,
     )
   })
 })

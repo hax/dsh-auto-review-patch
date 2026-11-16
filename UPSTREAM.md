@@ -52,11 +52,14 @@ node scripts/verify-upstream.mjs
 ```
 
 This checks the snapshot hashes, applies
-`patches/0001-return-concise-reviewer-denial-reasons.patch` and then
-`patches/0002-add-human-approval-timeout.patch` to a pristine copy and requires
-the result to be byte-identical to this repository's `src/index.ts`, requires
-patch 0001 alone to reproduce the committed Issue #3 source (`56a0252`), and
-checks the packaging files that must mirror upstream.
+`patches/0001-return-concise-reviewer-denial-reasons.patch`,
+`patches/0002-add-human-approval-timeout.patch` and
+`patches/0003-fix-approval-grant-unload-race.patch` to a pristine copy and
+requires the result to be byte-identical to this repository's `src/index.ts`,
+requires the frozen patches to still reproduce the committed Issue #3 source
+(`56a0252`) and Issue #5 source (`5972f49`), verifies the patches apply only in
+their committed order and touch only the production source, and checks the
+packaging files that must mirror upstream.
 
 Online, against the git tag:
 
@@ -95,4 +98,7 @@ export from this package: `approvalTimeoutMinutes`, the
 `AutoReviewApprovalTimeoutError` identity and `AUTO_REVIEW_APPROVAL_TIMEOUT` are
 fork-only. The `@deepseek-ai/schemastery` dependency added for the Loader schema
 is the same version upstream DSH packages declare, and it is not an upstream
-Auto review dependency.
+Auto review dependency. The #0003 grant-versus-unload race fix also has no
+upstream spec coverage; its regression tests live in
+`tests/unload-race.test.mjs` and mirror the documented synchronous
+`Session.append()` observer notification.

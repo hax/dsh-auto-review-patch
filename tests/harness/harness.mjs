@@ -65,6 +65,7 @@ function toolErrorResult(error) {
 function createFakeSession(id) {
   const events = []
   const surfaceNodes = []
+  const appendObservers = []
   let requestHeader
   let turnOpen = false
   const session = {
@@ -76,6 +77,19 @@ function createFakeSession(id) {
     snapshotEvents() { return events },
     requestHeader() { return requestHeader },
     isOwnSeq() { return true },
+    /**
+     * Test-only: observe each committed event synchronously, like the real
+     * Session's `session/event` observers after the log push. Lets a test run
+     * code (for example integration disposal) inside the `approval/decided`
+     * append that produces an `allowed-once` grant.
+     */
+    observeAppends(observer) {
+      appendObservers.push(observer)
+      return () => {
+        const index = appendObservers.indexOf(observer)
+        if (index >= 0) appendObservers.splice(index, 1)
+      }
+    },
     /** Append one event; only `surface: true` events enter the model surface. */
     append(type, data, options = {}) {
       const event = { type, seq: events.length, data }
@@ -83,6 +97,8 @@ function createFakeSession(id) {
       if (options.surface === true) surfaceNodes.push(event.seq)
       if (type === 'turn/start') turnOpen = true
       if (type === 'turn/end') turnOpen = false
+      // Mirror Session.append: observers run synchronously after the log push.
+      for (const observer of [...appendObservers]) observer(event)
       return event
     },
     /** Test-only: set the request header snapshot returned by `requestHeader()`. */

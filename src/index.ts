@@ -972,6 +972,53 @@ async function waitForApproval(
 }
 
 /**
+ * Map one settled approval wait only after re-reading the fused call,
+ * lifecycle, and deadline signals.
+ *
+ * Approval outcomes are produced while the approval service appends its
+ * `approval/decided` audit event, and that append synchronously notifies
+ * observers. An observer can therefore unload this integration or abort the
+ * caller after a grant is durable but before it is accepted here. Re-reading
+ * the fused signal after every approval await rejects such an `allowed-once`
+ * grant as the pipeline's canonical cancellation, so a granted body can never
+ * dispatch after unload or caller cancellation. A caller/lifecycle cancellation
+ * wins over the deadline; an elapsed deadline alone maps to the #5
+ * human-response timeout.
+ *
+ * @param ctx - composed harness context owning the approval seam.
+ * @param agent - the reviewed call's agent, which routes and audits the ask.
+ * @param exec - immutable pending execution.
+ * @param settlement - the wait's settled outcome or timeout marker.
+ * @param signal - call lifetime fused with the integration lifecycle.
+ * @param deadline - deadline signal when `approvalTimeoutMinutes` is enabled.
+ * @param timeoutMs - configured wait in milliseconds (0 when disabled).
+ * @param reason - optional concise reviewer decision reason.
+ * @returns the allow/deny/cancel decision that replaces the `ask` gate.
+ */
+function settleApproval(
+  ctx: Context,
+  agent: Agent,
+  exec: ToolExecution,
+  settlement: ApprovalWait,
+  signal: AbortSignal,
+  deadline: AbortSignal | undefined,
+  timeoutMs: number,
+  reason?: string,
+): PreToolDecision {
+  // Cancellation by the caller or by this integration's disposal is final: it
+  // must never be turned back into a grant by an outcome that raced it.
+  if (isAborted(signal)) return { kind: 'cancel' }
+  const deadlineExpired = deadline !== undefined && isAborted(deadline)
+  if (settlement.kind === 'timeout'
+    || (deadlineExpired && (settlement.outcome === 'allowed-once' || settlement.outcome === 'cancelled'))) {
+    // A lone elapsed deadline is human non-response, not a human rejection. The
+    // deadline is re-read here too so a grant can never win the same tick.
+    return approvalTimedOut(exec, timeoutMs, reason)
+  }
+  return mapApprovalOutcome(ctx, agent, exec, settlement.outcome, reason)
+}
+
+/**
  * Put one reviewer-denied call to the composed approval answerers.
  *
  * The official plugin returned an `ask` pre-execute decision and let
@@ -984,6 +1031,11 @@ async function waitForApproval(
  * reviewer's concise reason. The request signal is the reviewed call's signal
  * fused with this integration's disposal signal, so teardown withdraws a
  * pending question instead of leaving a grant able to dispatch after unload.
+ *
+ * Every approval await re-reads that fused signal before its outcome is mapped
+ * ({@link settleApproval}), because the approval service's synchronous
+ * `approval/decided` append can run an observer that unloads this integration
+ * or aborts the caller after the grant is durable.
  *
  * A positive `approvalTimeoutMinutes` derives one additional deadline for this
  * question only. That deadline joins the composed signal, so a timeout
@@ -1020,7 +1072,10 @@ async function askUser(
   }
   const timeoutMs = resolveApprovalTimeoutMs(readConfigValue(timeoutConfig))
   if (timeoutMs === 0 || isAborted(signal)) {
-    return mapApprovalOutcome(ctx, agent, exec, await ctx.approval.request(request), reason)
+    const outcome = await ctx.approval.request(request)
+    // The direct (timeout-less) path needs the same post-await signal re-check:
+    // an unload or caller abort can land while the approval service settles.
+    return settleApproval(ctx, agent, exec, { kind: 'outcome', outcome }, signal, undefined, 0, reason)
   }
   // Derive the deadline only for a question that is really about to wait for a
   // human; the timer is always cleared when the question settles.
@@ -1032,20 +1087,7 @@ async function askUser(
   try {
     const combined = AbortSignal.any([signal, deadline.signal])
     const wait = await waitForApproval(ctx, { ...request, signal: combined }, deadline)
-    if (wait.kind === 'timeout') {
-      // Caller cancellation and integration teardown stay cancellations even
-      // when they race the deadline; they are not human non-response.
-      return isAborted(signal)
-        ? mapApprovalOutcome(ctx, agent, exec, 'cancelled', reason)
-        : approvalTimedOut(exec, timeoutMs, reason)
-    }
-    const decision = mapApprovalOutcome(ctx, agent, exec, wait.outcome, reason)
-    if (decision.kind === 'cancel' && isAborted(deadline.signal) && !isAborted(signal)) {
-      // The approval service observed the deadline abort before this race did:
-      // the question was withdrawn because no human answered in time.
-      return approvalTimedOut(exec, timeoutMs, reason)
-    }
-    return decision
+    return settleApproval(ctx, agent, exec, wait, signal, deadline.signal, timeoutMs, reason)
   } finally {
     clearTimeout(timer)
   }
@@ -1110,7 +1152,13 @@ export function apply(ctx: Context, config: AutoReviewConfig = {}): void {
         const downstream = await next()
         if (isAborted(lifecycle.signal)) return { kind: 'cancel' }
         if (decision.decision === 'allow' || downstream.kind !== 'allow') return downstream
-        return askUser(ctx, agent, exec, signal, config.approvalTimeoutMinutes, decision.reason)
+        const approval = await askUser(ctx, agent, exec, signal, config.approvalTimeoutMinutes, decision.reason)
+        // askUser re-reads the fused signal before accepting a grant, but this
+        // integration can still be unloaded between that return and the
+        // listener's own return to the pipeline; close that window too so an
+        // accepted grant cannot dispatch a body after unload.
+        if (isAborted(lifecycle.signal)) return { kind: 'cancel' }
+        return approval
       } finally {
         active.delete(completed.promise)
         completed.resolve()
