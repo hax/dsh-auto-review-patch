@@ -10,19 +10,24 @@ Unofficial standalone fork of the official DSH package
 - [Issue #5](https://github.com/hax/dsh-auto-review-model/issues/5): add a
   configurable minute-level **human-response timeout** for the one human
   approval question this patch may ask, denying as human non-response instead of
-  waiting forever.
+  waiting forever;
+- **Phase 1 deterministic rule gate** (fork-only, opt-in): a small, closed set
+  of read-only calls can skip the reviewer, a conservative hard floor can deny
+  destructive shell commands, and every unproven call still goes to the
+  reviewer. The default `off` leaves existing behavior byte-identical.
 
 This repository is an **unofficial patch/fork**: it is not published and is
 not installed in the running profile by this task. It is based
 on the current DSH `0.2.2-rc.3` official source; exact upstream provenance is in
-[UPSTREAM.md](UPSTREAM.md). The production delta is stored as five independent,
+[UPSTREAM.md](UPSTREAM.md). The production delta is stored as six independent,
 ordered patches:
 `patches/0001-return-concise-reviewer-denial-reasons.patch` (Issue #3, frozen),
 `patches/0002-add-human-approval-timeout.patch` (Issue #5, frozen),
 `patches/0003-fix-approval-grant-unload-race.patch` (grant/unload race fix),
 `patches/0004-inline-fiber-state-active.patch` (frozen load-time `FiberState`
-fix), and `patches/0005-add-auto-deny-reviewer-rejections.patch` (full-auto
-reviewer-denial switch).
+fix), `patches/0005-add-auto-deny-reviewer-rejections.patch` (full-auto
+reviewer-denial switch, frozen), and
+`patches/0006-add-rule-gate-phase1.patch` (Phase 1 deterministic rule gate).
 
 ## Behavior
 
@@ -186,8 +191,8 @@ How the deadline works:
 - the existing approval failure containment is unchanged: an approval request
   that throws still fails the call exactly as before and the timer is cleared.
 
-Both Loader settings (`approvalTimeoutMinutes` and
-`autoDenyReviewerRejections`) are configured on the Auto review bundle row; see
+All Loader settings (`approvalTimeoutMinutes`, `autoDenyReviewerRejections`,
+`ruleGate` and `ruleGateLog`) are configured on the Auto review bundle row; see
 [Where to configure the settings](#where-to-configure-the-settings).
 
 Scope limit: the deadline belongs to the plugin's own direct approval question.
@@ -224,6 +229,124 @@ other outcome mappings are unchanged, and the tool body never executes. The
 regression tests trigger disposal and caller aborts from a synchronous
 `approval/decided` observer in both the timeout-less and deadline paths.
 
+### 7. Phase 1 deterministic rule gate (`ruleGate`)
+
+A deterministic gate runs **before** the reviewer for exactly the same
+Auto-preset calls the listener already reviews. Phase 1 is deliberately narrow:
+**it never allows a shell command.** Read-only shell parsing is Phase 2 and out
+of scope.
+
+| `ruleGate` | Reviewer | Decision record | Behavior |
+| --- | --- | --- | --- |
+| `off` (default) | called exactly as before | none | byte-identical to the pre-gate fork |
+| `shadow` | called exactly as in `off` | one JSONL line per reviewed call | computes a tier for analysis; every decision is still the reviewer's |
+| `enforce` | skipped for `allow` / `deny`; called for `escalate` | one JSONL line per reviewed call | `allow` uses the existing `next()` pass-through, `deny` returns before the reviewer, everything else falls through to today's reviewer |
+
+#### What Phase 1 allows
+
+Only these rules, and only when every check succeeds:
+
+- `A01_READONLY_READ` — tool `read`, `file_path` resolves inside the **session
+  workspace** (`ctx.workingDirectory.ensure(...)`, not the process cwd) after
+  `~` expansion, `path.resolve` and `fs.realpathSync.native`. An existing
+  target is required; a missing target, a symlink that resolves outside, or any
+  realpath error escalates. The path denylist below also applies.
+- `A02_READONLY_SEARCH` — tool `grep` or `glob`. `path` is optional; absent
+  means the session workspace. A present `path` must resolve inside it and pass
+  the same denylist.
+- `A04_META_READ` — tool name in exactly this list: `job_output`, `job_list`,
+  `wait_agent`, `list_agents`, `get_goal`, `list_subagent_models`,
+  `todo_write`, `skill`, `structured_output`, `agent_teams_status`,
+  `team_task_list`, `team_task_get`, `schedule_list`, `schedule_view`,
+  `cordis_inspect_list`. `working_directory` is deliberately absent because it
+  mutates cwd state.
+
+Allow-rule path denylist: `.env*`, `.ssh/`, `id_rsa*`, `id_ed25519*`, `*.pem`,
+`*.key`, `credentials*`, `.aws/`, `.npmrc`, `.git-credentials`, `.netrc`,
+`.git/config`, `.dsh*`, `.agent-teams/`, `cordis.patch.yml`, `settings.yaml`,
+`.credentials.yaml`.
+
+#### What Phase 1 denies
+
+Only `bash`, matched case-insensitively against the raw command text, and only
+for this conservative hard floor:
+
+- `D1_RECURSIVE_FORCE_DELETE` — `rm` with both recursive and force flags
+  targeting `/`, `/*`, `~`, `$HOME`, the session workspace root, or one of their
+  ancestors, including `--no-preserve-root` (`rm -rf /`, `rm -fr /*`,
+  `rm -rf ~`, `rm -rf .` at the workspace root, `rm -rf <cwd>`, …).
+- `D2_DEVICE_DESTRUCTION_OR_FORK_BOMB` — `mkfs*`, `dd … of=/dev/…`,
+  `> /dev/sd*` (block devices, not `/dev/null`), `wipefs`, `shred /dev/…`, and
+  the fork bomb `:(){ :|:& };:`.
+- `D3_SYSTEM_DIRECTORY_WRITE` — writes into `/etc`, `/usr`, `/bin`, `/sbin`,
+  `/System`, `/Library` or `/boot` through redirection, `tee`, `cp`, `mv`,
+  `install` or `sed -i`. A pure read of those directories is **not** denied (it
+  escalates).
+- `D5_GIT_HISTORY_REWRITE` — `git filter-branch`,
+  `git reflog expire --expire=now --all`, `git gc --prune=now`.
+  `git reset --hard` is **not** D5; it escalates.
+
+Everything else is `escalate` and goes to today's reviewer: every other shell
+command, agent/VCS-config and credential paths, `..` escapes, absolute paths
+outside the workspace, `~/…` outside, symlinks resolving outside, unknown
+tools, missing or ill-typed arguments, and any parse ambiguity. Phase 1 does
+**not** implement D4 (secret-exfiltration data flow); that still escalates.
+
+A deny returns a `PreToolDecision` with its own persisted identity
+`{ name: 'AutoReviewRuleDeniedError', code: 'AUTO_REVIEW_RULE_DENIED' }`, so it
+is distinguishable from a reviewer denial (`AUTO_REVIEW_DENIED`) and an
+approval denial. The tool body never executes. An allow returns `next()`, not
+`{ kind: 'allow' }`: the reviewer is the only step skipped, while every
+downstream pre-execute gate, guard and dispatch stays identical.
+
+The gate fails closed. If it throws for any reason it logs and escalates to the
+reviewer; it never fails the tool call and never fabricates an allow.
+
+#### Configuration
+
+| Field | Type | Default | Semantics |
+| --- | --- | --- | --- |
+| `ruleGate` | `'off' \| 'shadow' \| 'enforce'` | `'off'` | Unknown or malformed values normalize to `off`. Volatile, read per reviewed call. |
+| `ruleGateLog` | string | `~/.dsh/state/auto-review-rule-gate/decisions.jsonl` | JSONL decision record for `shadow` / `enforce`. Leading `~` expands; a relative path resolves against the session cwd. Volatile. |
+
+#### Shadow rollout procedure
+
+1. Set `ruleGate: shadow` and keep `ruleGateLog` at a writable path. The
+   reviewer and every allow/deny/ask decision stay exactly as they are today.
+2. Run shadow for at least **2 weeks and 10,000 reviewed calls**, whichever
+   takes longer, across the workflows the deployment actually uses.
+3. Compare the records with the reviewer/session logs. Every `tier: allow`
+   record must correspond to a reviewer allow (the reviewer still decided the
+   call in shadow); a mismatch means the deterministic rule is broader than the
+   reviewer and must be tightened. Every `tier: deny` record must be a command
+   that is genuinely in the D1–D5 hard floor.
+4. Promote to `enforce` only after no `allow` record contradicts a reviewer
+   denial and every `deny` is expected. Any unexplained record means staying in
+   shadow, not ignoring the mismatch.
+5. Keep `ruleGateLog` configured after promotion so enforced allow/deny records
+   stay auditable.
+
+The record is one JSON line per shadow/enforce reviewed call:
+`{ts, mode, tier, rule, tool, sessionIdHash, argLength, cwdRelative}`. It
+deliberately contains **no tool arguments, no command text, no file contents
+and no raw session id**: `sessionIdHash` is the first 12 hexadecimal characters
+of the SHA-256 of the session id, and `cwdRelative` is the workspace-relative
+path for path rules (`null` otherwise; never an absolute path). The record
+directory is created `0700` and the file `0600`. `off` writes nothing.
+
+#### Phase 1 limits, stated honestly
+
+- **Shell commands are never allowed.** Only the bash deny hard floor is
+  evaluated; every other shell command escalates. Read-only shell parsing is
+  Phase 2.
+- D4 (secret-exfiltration data flow) is not implemented; exfiltration remains an
+  `escalate` for the reviewer.
+- The deny floor is a conservative text heuristic, not a shell parser. It can
+  miss an obfuscated destructive command (which then escalates); it is never
+  used to allow anything.
+- The path model and `fs.realpathSync.native` checks target POSIX; no Windows
+  path handling is claimed.
+
 ### Why the plugin calls `approval.request()` itself
 
 `ToolsPipeline.prepare()` applies the `tools/pre-execute` waterfall **first**
@@ -258,8 +381,9 @@ The minimal reliable fix is therefore to call the **public**
 
 ## Where to configure the settings
 
-Both settings are ordinary Loader `Config` fields of the Auto review bundle, so
-they are set on the `auto-review` row in the active profile's Cordis patch.
+All four settings are ordinary Loader `Config` fields of the Auto review
+bundle, so they are set on the `auto-review` row in the active profile's Cordis
+patch.
 
 - **Web GUI:** the sidebar **Plugins** page edits configuration only for
   plugins that ship their own configuration page (the `auto-review-model` fork
@@ -269,7 +393,7 @@ they are set on the `auto-review` row in the active profile's Cordis patch.
   (`@deepseek-ai/dsh-settings` supports such forms, but no shipped client builds
   pages from the schema yet). The **Plugins** page and **Settings → Built-in
   plugins** therefore list the Auto review bundle and its inventory, while its
-  two config values are edited in the profile patch below.
+  four config values are edited in the profile patch below.
 - **Profile patch (the supported path):** edit the active profile's
   `cordis.patch.yml` — on Desktop
   `~/.dsh/profiles/<profile>/cordis.patch.yml` — and override the installed
@@ -281,13 +405,16 @@ they are set on the `auto-review` row in the active profile's Cordis patch.
     config:
       approvalTimeoutMinutes: 5
       autoDenyReviewerRejections: true
+      ruleGate: shadow
+      ruleGateLog: ~/.dsh/state/auto-review-rule-gate/decisions.jsonl
   ```
 
-  Both fields are `volatile`, so once the profile change is applied
+  All four fields are `volatile`, so once the profile change is applied
   (`config-editor`/HMR), the next reviewed call reads the new values without
   remounting the integration; without HMR the change applies after a restart.
   Omitting a field keeps its schema default (`approvalTimeoutMinutes: 0`,
-  `autoDenyReviewerRejections: false`).
+  `autoDenyReviewerRejections: false`, `ruleGate: 'off'`, `ruleGateLog:
+  ~/.dsh/state/auto-review-rule-gate/decisions.jsonl`).
 
 ## Upstream drift risk
 
@@ -314,20 +441,23 @@ and the upstream ask-path tests assert only `the user rejected tool "<name>"`.
 Porting this patch upstream requires updating those assertions together with
 the new regression tests in this repository.
 
-The #5 and full-auto-denial additions are fork-only as well: the official
-plugin exports no `Config` schema, so `approvalTimeoutMinutes`,
-`autoDenyReviewerRejections`, `AutoReviewApprovalTimeoutError` and
-`AUTO_REVIEW_APPROVAL_TIMEOUT` have no upstream counterpart. This fork therefore
-declares `@deepseek-ai/schemastery` (`~3.19.0`, the version upstream DSH
-packages declare) as a **peer dependency** for its Loader config schema; official
-Auto review does not need it. A peer, not a dependency: DSH installs this fork
-as a `link:` into the profile, and pnpm does not install a linked package's own
-`dependencies`, so a plain dependency is never resolvable at runtime — the DSH
-loader only routes a bare import to the installation's copy when the importing
-package declares it in `peerDependencies` (see the note below).
-The upstream spec does not cover a human-response timeout or the full-auto
-reviewer-denial switch at all, so the regression tests in this repository are
-their only automated coverage.
+The #5, full-auto-denial and rule-gate additions are fork-only as well: the
+official plugin exports no `Config` schema, so `approvalTimeoutMinutes`,
+`autoDenyReviewerRejections`, `ruleGate`, `ruleGateLog`,
+`AutoReviewApprovalTimeoutError`, `AUTO_REVIEW_APPROVAL_TIMEOUT`,
+`AutoReviewRuleDeniedError` and `AUTO_REVIEW_RULE_DENIED` have no upstream
+counterpart. The Phase 1 gate also adds Node built-in usage (`node:crypto`,
+`node:fs`, `node:os`, `node:path`) that official Auto review never imports. This
+fork therefore declares `@deepseek-ai/schemastery` (`~3.19.0`, the version
+upstream DSH packages declare) as a **peer dependency** for its Loader config
+schema; official Auto review does not need it. A peer, not a dependency: DSH
+installs this fork as a `link:` into the profile, and pnpm does not install a
+linked package's own `dependencies`, so a plain dependency is never resolvable
+at runtime — the DSH loader only routes a bare import to the installation's copy
+when the importing package declares it in `peerDependencies` (see the note
+below). The upstream spec does not cover a human-response timeout, the
+full-auto reviewer-denial switch or the deterministic rule gate at all, so the
+regression tests in this repository are their only automated coverage.
 
 The #0003 fix additionally relies on the documented `Session.append()` behavior
 of notifying `session/event` observers synchronously after the log push; that is
@@ -398,15 +528,16 @@ installed packages.
 ## Layout
 
 ```
-src/index.ts                 patched production source (real official code + five minimal patches)
+src/index.ts                 patched production source (real official code + six minimal patches)
 src/locales.ts               verbatim upstream production source
-types/                       trimmed 0.2.2-rc.3 ambient declarations for offline typecheck
+types/                       trimmed 0.2.2-rc.3 ambient declarations + Node built-in shims for offline typecheck
 upstream/dsh-v0.2.2-rc.3/    pristine upstream snapshot + SHA256SUMS
 patches/0001-*.patch         Issue #3 denial-reason delta vs the pristine snapshot (frozen)
 patches/0002-*.patch         Issue #5 human-response timeout delta, applied after 0001 (frozen)
 patches/0003-*.patch         grant-versus-unload race fix, applied after 0002
 patches/0004-*.patch         inlined `FiberState.ACTIVE` literal, applied after 0003 (frozen)
-patches/0005-*.patch         full-auto reviewer-denial switch, applied after 0004
+patches/0005-*.patch         full-auto reviewer-denial switch, applied after 0004 (frozen)
+patches/0006-*.patch         Phase 1 deterministic rule gate, applied after 0005
 tests/harness/               deterministic fake Cordis context / Session / tool pipeline
 tests/stubs/                 test doubles for the six runtime @deepseek-ai imports
 tests/denial-feedback.test.mjs    never-mode denial, failure, CoT and body-suppression tests
@@ -414,7 +545,8 @@ tests/ask-approval.test.mjs       approval mapping/audit/approval-mode/teardown 
 tests/approval-timeout.test.mjs   timeout config, deadline, late-answer, cancellation and cleanup tests
 tests/unload-race.test.mjs        grant-versus-unload/caller-cancel race tests
 tests/auto-deny.test.mjs          full-auto reviewer-denial setting tests
-scripts/make-patch.mjs       rebuilds 0003 from commit a25f516 and 0005 from the frozen 0001-0004 source (never rewrites frozen 0004)
+tests/rule-gate.test.mjs          Phase 1 mode, allow/deny catalog, fail-closed and record-privacy tests
+scripts/make-patch.mjs       rebuilds 0003 from commit a25f516 and 0006 from the frozen 0001-0005 source (never rewrites frozen 0004/0005)
 scripts/verify-upstream.mjs  offline provenance and ordered patch-reproduction checks
 ```
 
@@ -459,7 +591,7 @@ npm test                   # run tests against src/ via Node's TypeScript stripp
 npm run build              # emit lib/index.js + lib/locales.js (+ .d.ts)
 npm run test:lib           # run the same tests against the built lib/ artifact
 npm run check              # node --check on built JS and the verify script
-npm run verify:upstream    # snapshot hashes; pristine + 0001..0005 == src/index.ts; 0001/0002/0003 == commits 56a0252/5972f49/a25f516; 0004 frozen
+npm run verify:upstream    # snapshot hashes; pristine + 0001..0006 == src/index.ts; 0001/0002/0003 == commits 56a0252/5972f49/a25f516; 0004/0005 frozen
 npm run verify             # all of the above, from an empty node_modules
 ```
 
@@ -467,17 +599,18 @@ On a networked machine a plain `npm install` remains available; the vendored
 tarball is only the deterministic offline path for the current no-install
 verification environment.
 
-Current status in this working tree: `typecheck` clean, 57/57 tests pass in
+Current status in this working tree: `typecheck` clean, 83/83 tests pass in
 both source and `lib/` modes (21 Issue #3 + 21 Issue #5 + 4 grant/unload race +
-11 full-auto denial), builds and syntax checks pass, 14/14 offline provenance
-checks pass (pristine + 0001 + 0002 + 0003 + 0004 + 0005 reconstruct
-`src/index.ts` byte-for-byte, the stored patches still reproduce the committed
-Issue #3 source at `56a0252`, Issue #5 source at `5972f49` and grant/unload race
-fix at `a25f516`, and frozen patch 0004 still produces its recorded source), and
-`git diff --check` is clean. This was re-verified from
-an empty `node_modules` in a plain shell with no `tsc` on `PATH`: `npm run
-verify` bootstraps the vendored TypeScript offline and completes in a few
-seconds, and `npm run typecheck` / `npm run build` work standalone the same way.
+11 full-auto denial + 26 rule gate), builds and syntax checks pass, 15/15
+offline provenance checks pass (pristine + 0001 + 0002 + 0003 + 0004 + 0005 +
+0006 reconstruct `src/index.ts` byte-for-byte, the stored patches still
+reproduce the committed Issue #3 source at `56a0252`, Issue #5 source at
+`5972f49` and grant/unload race fix at `a25f516`, and frozen patches 0004 and
+0005 still produce their recorded sources), and `git diff --check` is clean.
+This was re-verified from an empty `node_modules` in a plain shell with no `tsc`
+on `PATH`: `npm run verify` bootstraps the vendored TypeScript offline and
+completes in a few seconds, and `npm run typecheck` / `npm run build` work
+standalone the same way.
 
 ### Coverage limits in this standalone fork
 
@@ -509,6 +642,13 @@ seconds, and `npm run typecheck` / `npm run build` work standalone the same way.
   `dsh-settings`): no shipped Web client auto-generates a form from a bundle
   `Config` schema yet, and this Host-only fork ships no client page. A live
   Plugins/Settings UI and a real profile-patch write were not exercised here.
+- The Phase 1 rule-gate tests cover the real `read`/`grep`/`glob`/metadata and
+  `bash` argument shapes through the harness, including temp-workspace symlinks,
+  but they do not exercise the real `read`/`grep`/`glob` tool bodies, a live
+  Windows filesystem, or the default `~/.dsh/...` record path (tests always use
+  an explicit temp path and never write `~/.dsh`). The deny hard floor is a
+  text heuristic, not a shell parser; only the documented D1–D5 shapes are
+  locked by tests.
 - No live DSH route, real `ApprovalService` or real model was exercised: this
   task does not install the fork. Real-process verification belongs to the
   separate installation/verification workstream.
@@ -522,9 +662,12 @@ seconds, and `npm run typecheck` / `npm run build` work standalone the same way.
   concise `decision.reason` is the only additional text forwarded.
 - No timeout for approval questions this plugin does not ask itself (the
   pipeline's own downstream `ask` gate).
-- No Client/Settings page for the two Loader settings; this fork stays
-  Host-only and its config is edited through the profile patch (see
+- No Client/Settings page for the Loader settings; this fork stays Host-only
+  and its config is edited through the profile patch (see
   [Where to configure the settings](#where-to-configure-the-settings)).
+- Phase 1 of the rule gate does not parse or allow shell commands, does not
+  implement D4 (secret-exfiltration data flow), and does not attempt a general
+  shell-safety model; read-only shell parsing is Phase 2.
 
 ## License
 

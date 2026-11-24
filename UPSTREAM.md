@@ -55,12 +55,14 @@ This checks the snapshot hashes, applies
 `patches/0001-return-concise-reviewer-denial-reasons.patch`,
 `patches/0002-add-human-approval-timeout.patch`,
 `patches/0003-fix-approval-grant-unload-race.patch`,
-`patches/0004-inline-fiber-state-active.patch` and
-`patches/0005-add-auto-deny-reviewer-rejections.patch` to a pristine copy and
+`patches/0004-inline-fiber-state-active.patch`,
+`patches/0005-add-auto-deny-reviewer-rejections.patch` and
+`patches/0006-add-rule-gate-phase1.patch` to a pristine copy and
 requires the result to be byte-identical to this repository's `src/index.ts`,
 requires the stored patches to still reproduce the committed Issue #3 source
 (`56a0252`), Issue #5 source (`5972f49`) and grant/unload race fix (`a25f516`),
-requires the frozen patch 0004 to keep producing its recorded source, verifies
+requires the frozen patches 0004 and 0005 to keep producing their recorded
+sources, verifies
 the patches apply only in their committed order and touch only the production
 source, and checks the packaging files that must mirror upstream.
 
@@ -96,14 +98,17 @@ grant`: they assert that a human rejection reaches the Agent only as
 `the user rejected tool "probe"`, with the reviewer's concern retained solely in
 the approval audit/UI (`approval/asked.reason`).
 
-The upstream spec has no human-response-timeout or full-auto-denial coverage and
-expects no `Config` export from this package: `approvalTimeoutMinutes`,
-`autoDenyReviewerRejections`, the `AutoReviewApprovalTimeoutError` identity and
-`AUTO_REVIEW_APPROVAL_TIMEOUT` are fork-only. The `@deepseek-ai/schemastery` **peer** declaration added for the
-Loader schema names the same version upstream DSH packages declare (the DSH
-installation supplies it at runtime), and it is not an upstream Auto review
-peer declaration. The #0003 grant-versus-unload race fix and the #0005 full-auto
-reviewer-denial switch also have no upstream spec coverage; their regression
-tests live in `tests/unload-race.test.mjs` and `tests/auto-deny.test.mjs`, and
-the race tests mirror the documented synchronous `Session.append()` observer
-notification.
+The upstream spec has no human-response-timeout, full-auto-denial or
+deterministic-rule-gate coverage and expects no `Config` export from this
+package: `approvalTimeoutMinutes`, `autoDenyReviewerRejections`, `ruleGate`,
+`ruleGateLog`, the `AutoReviewApprovalTimeoutError` and
+`AutoReviewRuleDeniedError` identities, `AUTO_REVIEW_APPROVAL_TIMEOUT` and
+`AUTO_REVIEW_RULE_DENIED` are fork-only. The `@deepseek-ai/schemastery` **peer**
+declaration added for the Loader schema names the same version upstream DSH
+packages declare (the DSH installation supplies it at runtime), and it is not an
+upstream Auto review peer declaration. The #0003 grant-versus-unload race fix,
+the #0005 full-auto reviewer-denial switch and the #0006 Phase 1 rule gate also
+have no upstream spec coverage; their regression tests live in
+`tests/unload-race.test.mjs`, `tests/auto-deny.test.mjs` and
+`tests/rule-gate.test.mjs`, and the race tests mirror the documented synchronous
+`Session.append()` observer notification.
