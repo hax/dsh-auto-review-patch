@@ -363,6 +363,25 @@ Both are properties of the installed runtime, not of the upstream source, so the
 (`ctx.root.fiber.state` is a number; no importable `FiberState`) and the local
 cordis test double carries the numeric member order instead of a string.
 
+### Peer ranges must track the runtime, not one release
+
+DSH rejects a whole bundle whose `@deepseek-ai/dsh`/`@deepseek-ai/dsh-*` peer
+ranges do not satisfy the **running** version (`evaluatePluginCompatibility`), and
+it does so **silently from the plugin's point of view**: no activation, no
+`auto` permission preset, and every Session pinned to that preset degrades to
+the derived `custom` preset — the composer then reports the Session as
+unavailable and cannot send. This is what a Desktop auto-update from
+`0.2.2-rc.3` to `0.2.2-rc.5` produced while the peers here were pinned to the
+exact `0.2.2-rc.3`: the fork's `lib/index.js` was fine, the pin was not.
+
+The peers are therefore ranges (`>=0.2.2-rc.3 <0.2.3`) rather than one exact
+release. Widening them was verified safe rather than assumed: the official
+`@deepseek-ai/dsh-experimental-auto-review` source shipped in `0.2.2-rc.5` is
+**byte-identical** to the `0.2.2-rc.3` snapshot this fork patches
+(sha256 `72968d3c…`), and `@deepseek-ai/cordis` (4.1.0) and
+`@deepseek-ai/schemastery` (3.19.0) did not move. Re-check both facts before
+widening again for a future release.
+
 Verified against the installed build with the runtime's own profile resolver:
 
 ```sh
