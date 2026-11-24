@@ -8,7 +8,7 @@
 # Apply:    git apply -p1 patches/0001-return-concise-reviewer-denial-reasons.patch
 #           git apply -p1 patches/0002-add-human-approval-timeout.patch
 #           git apply -p1 patches/0003-fix-approval-grant-unload-race.patch
-#           (or: npm run verify:upstream checks all five patches reproduce this fork's src/index.ts)
+#           (or: npm run verify:upstream checks all six patches reproduce this fork's src/index.ts)
 --- a/src/index.ts
 +++ b/src/index.ts
 @@ -968,7 +968,54 @@

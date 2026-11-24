@@ -246,7 +246,9 @@ declare module '@deepseek-ai/schemastery' {
     min(value: number): NumberSchema
     max(value: number): NumberSchema
   }
+  export interface StringSchema extends Schema<string> {}
   export interface SchemaFactory {
+    string(): StringSchema
     number(): NumberSchema
     boolean(): Schema<boolean>
     object(shape: Record<string, Schema<any>>): Schema<unknown>

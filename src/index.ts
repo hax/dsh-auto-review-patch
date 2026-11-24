@@ -8,6 +8,11 @@
  * @module @deepseek-ai/dsh-experimental-auto-review
  */
 
+import { createHash } from 'node:crypto'
+import { appendFileSync, mkdirSync, realpathSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, isAbsolute, relative, resolve as resolvePath, sep } from 'node:path'
+
 declare module '@deepseek-ai/dsh-llm/types' {
   interface LlmRequestPurposeMap {
     'auto-review': true
@@ -50,6 +55,10 @@ const AUTO_REVIEW_DENIED_CODE = 'AUTO_REVIEW_DENIED'
 const AUTO_REVIEW_FAILED_ERROR_NAME = 'AutoReviewFailedError'
 /** Structured error code persisted when review cannot produce a decision. */
 const AUTO_REVIEW_FAILED_CODE = 'AUTO_REVIEW_FAILED'
+/** Structured error name persisted when the deterministic rule gate denies a call. */
+const AUTO_REVIEW_RULE_DENIED_ERROR_NAME = 'AutoReviewRuleDeniedError'
+/** Structured error code persisted when the deterministic rule gate denies a call. */
+const AUTO_REVIEW_RULE_DENIED_CODE = 'AUTO_REVIEW_RULE_DENIED'
 /**
  * Structured error name the tool registry records when approval does not grant
  * a call. These three values are a persisted contract consumed by diagnostic
@@ -82,6 +91,68 @@ const FIBER_STATE_ACTIVE = 2
  * Node timer and `AbortSignal` deadline represent without clamping.
  */
 export const MAX_APPROVAL_TIMEOUT_MINUTES = 1_440
+
+/**
+ * Deterministic rule-gate modes (Phase 1).
+ *
+ * `off` is the default and preserves every existing behavior; `shadow` computes
+ * a verdict and writes a decision record but leaves the reviewer pipeline
+ * untouched; `enforce` short-circuits the reviewer for a deterministic `allow`
+ * or `deny` and falls through to the reviewer for every `escalate`.
+ */
+export type RuleGateMode = 'off' | 'shadow' | 'enforce'
+
+/** One deterministic rule-gate verdict tier. */
+export type RuleGateTier = 'allow' | 'deny' | 'escalate'
+
+/**
+ * Default JSONL decision-record path for `shadow` and `enforce`. `off` never
+ * writes a record. A leading `~` expands to the user's home directory.
+ */
+export const DEFAULT_RULE_GATE_LOG = '~/.dsh/state/auto-review-rule-gate/decisions.jsonl'
+
+/**
+ * Metadata-only tools the Phase 1 gate allows. The exact list is part of the
+ * contract; `working_directory` is deliberately absent because it mutates cwd
+ * state, and any omission falls through to the reviewer.
+ */
+const RULE_GATE_META_TOOLS: ReadonlySet<string> = new Set([
+  'job_output',
+  'job_list',
+  'wait_agent',
+  'list_agents',
+  'get_goal',
+  'list_subagent_models',
+  'todo_write',
+  'skill',
+  'structured_output',
+  'agent_teams_status',
+  'team_task_list',
+  'team_task_get',
+  'schedule_list',
+  'schedule_view',
+  'cordis_inspect_list',
+])
+
+/** Rule ids persisted with every deterministic verdict. */
+const RULE_A01_READONLY_READ = 'A01_READONLY_READ'
+const RULE_A02_READONLY_SEARCH = 'A02_READONLY_SEARCH'
+const RULE_A04_META_READ = 'A04_META_READ'
+const RULE_D1_RECURSIVE_ROOT_DELETE = 'D1_RECURSIVE_FORCE_DELETE'
+const RULE_D2_DEVICE_DESTRUCTION = 'D2_DEVICE_DESTRUCTION_OR_FORK_BOMB'
+const RULE_D3_SYSTEM_DIRECTORY_WRITE = 'D3_SYSTEM_DIRECTORY_WRITE'
+const RULE_D5_GIT_HISTORY_REWRITE = 'D5_GIT_HISTORY_REWRITE'
+/** Rule id for every fail-closed fall-through to the reviewer. */
+const RULE_E_ESCALATE = 'E_ESCALATE'
+
+/**
+ * Hard-floor system directories. Writing into one of these through an explicit
+ * write verb is denied; a pure read of the same path is only escalated.
+ */
+const SYSTEM_WRITE_PREFIXES: readonly string[] = ['/etc', '/usr', '/bin', '/sbin', '/System', '/Library', '/boot']
+
+/** Command wrappers whose word is skipped before the real command word. */
+const COMMAND_WRAPPERS: ReadonlySet<string> = new Set(['sudo', 'doas', 'command', 'env', 'nohup', 'time'])
 
 /** Fixed policy sent as the review request's system prompt. */
 const REVIEW_POLICY = `REVIEW_POLICY
@@ -214,10 +285,27 @@ export interface AutoReviewConfig {
    * volatile, so the next reviewed call reads a changed value.
    */
   readonly autoDenyReviewerRejections?: ConfigValue<boolean>
+  /**
+   * Deterministic rule-gate mode. `off` (default) preserves every existing
+   * behavior; `shadow` computes a verdict and writes one decision record but
+   * still calls the reviewer exactly like `off`; `enforce` short-circuits the
+   * reviewer only for a deterministic `allow` or `deny`, and every unproven or
+   * unsupported call falls through to today's reviewer. Unknown or malformed
+   * values normalize to `off`. The field is volatile, so the next reviewed call
+   * reads a changed value.
+   */
+  readonly ruleGate?: ConfigValue<RuleGateMode>
+  /**
+   * JSONL decision-record path used by `shadow` and `enforce` (never by `off`).
+   * A leading `~` expands to the user's home directory; a relative path
+   * resolves against the Session working directory. A record contains no tool
+   * arguments, no file contents and no raw session id. The field is volatile.
+   */
+  readonly ruleGateLog?: ConfigValue<string>
 }
 
 /**
- * Loader config schema. Both settings are volatile so a settings or config
+ * Loader config schema. Every setting is volatile so a settings or config
  * update changes the next reviewed call without remounting the integration.
  * The schema bounds the minute setting, and the live value is still
  * re-validated per question because a volatile ref can hold an untrusted value
@@ -226,6 +314,8 @@ export interface AutoReviewConfig {
 export const Config = z.object({
   approvalTimeoutMinutes: z.number().min(0).max(MAX_APPROVAL_TIMEOUT_MINUTES).default(0).volatile(),
   autoDenyReviewerRejections: z.boolean().default(false).volatile(),
+  ruleGate: z.string().default('off').volatile(),
+  ruleGateLog: z.string().default(DEFAULT_RULE_GATE_LOG).volatile(),
 })
 
 /** Largest delay Node timers and abort deadlines represent without clamping. */
@@ -282,6 +372,22 @@ export function resolveApprovalTimeoutMs(value: unknown): number {
     )
   }
   return milliseconds
+}
+
+/**
+ * Normalize one live `ruleGate` config value.
+ *
+ * Only the two explicit non-default modes are honored; every other value
+ * (missing, `off`, an unknown string, or a malformed live ref) normalizes to
+ * `off`, which keeps the current reviewer pipeline untouched. This is a
+ * deterministic, fail-open-to-current-behavior mapping: the rule gate can never
+ * become stricter because of a typo.
+ *
+ * @param value - any untrusted config value, including a live volatile ref's.
+ * @returns the effective mode.
+ */
+export function resolveRuleGateMode(value: unknown): RuleGateMode {
+  return value === 'shadow' || value === 'enforce' ? value : 'off'
 }
 
 /** Structured error identity for a human approval wait that exceeds its timeout. */
@@ -1128,6 +1234,604 @@ function failed(exec: ToolExecution, error: unknown): PreToolDecision {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1 deterministic rule gate.
+//
+// The gate runs before the reviewer and only proves a closed set of read-only
+// actions (A01/A02/A04) or matches the conservative hard floor for destructive
+// shell commands (D1/D2/D3/D5). Every other call — including every shell
+// command that does not match the hard floor — escalates to today's reviewer.
+// Shell commands are never allowed in Phase 1: read-only shell parsing is
+// Phase 2 and deliberately out of scope.
+// ---------------------------------------------------------------------------
+
+/** Render one error's text without assuming it is an Error instance. */
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** Return one token's final path component (the command word for `/bin/rm`). */
+function baseName(token: string): string {
+  const parts = token.split('/')
+  return parts.at(-1) ?? token
+}
+
+/** Strip one matching pair of shell quotes from a token. */
+function unquoteToken(token: string): string {
+  if (token.length < 2) return token
+  const first = token[0]
+  const last = token.at(-1)
+  if ((first === '"' && last === '"') || (first === "'" && last === "'") || (first === '`' && last === '`')) {
+    return token.slice(1, -1)
+  }
+  return token
+}
+
+/** Split one simple command into whitespace tokens, keeping quoted spaces. */
+function tokenizeSegment(segment: string): string[] {
+  const matches = segment.match(/(?:[^\s"'`]+|"[^"]*"|'[^']*'|`[^`]*`)/gu)
+  return (matches ?? []).map(unquoteToken)
+}
+
+/**
+ * Split a raw command into simple-command tokens on unquoted separators.
+ *
+ * This is not a shell parser and deliberately does not model expansion,
+ * substitutions or operators: it only keeps the hard-floor matchers from
+ * treating text inside quotes as a command. Phase 1 never allows a shell
+ * command, so every unproven command still escalates.
+ */
+function shellSegments(command: string): string[][] {
+  const segments: string[] = []
+  let current = ''
+  let quote: '"' | "'" | '`' | undefined
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]
+    if (char === undefined) break
+    if (quote !== undefined) {
+      current += char
+      if (char === quote) quote = undefined
+      continue
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char
+      current += char
+      continue
+    }
+    if (char === '\\') {
+      current += char
+      const next = command[index + 1]
+      if (next !== undefined) {
+        current += next
+        index += 1
+      }
+      continue
+    }
+    if (char === ';' || char === '\n' || char === '&' || char === '|') {
+      segments.push(current)
+      current = ''
+      continue
+    }
+    current += char
+  }
+  segments.push(current)
+  return segments.filter(segment => segment.trim() !== '').map(tokenizeSegment)
+}
+
+/** Blank every quoted or backslash-escaped region, keeping unquoted operators. */
+function maskQuoted(command: string): string {
+  let masked = ''
+  let quote: '"' | "'" | '`' | undefined
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]
+    if (char === undefined) break
+    if (quote !== undefined) {
+      masked += ' '
+      if (char === quote) quote = undefined
+      continue
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char
+      masked += ' '
+      continue
+    }
+    if (char === '\\') {
+      masked += ' '
+      const next = command[index + 1]
+      if (next !== undefined) {
+        masked += ' '
+        index += 1
+      }
+      continue
+    }
+    masked += char
+  }
+  return masked
+}
+
+/**
+ * Locate one segment's command word, skipping environment assignments and
+ * wrapper words such as `sudo`. Wrapper options are intentionally not parsed:
+ * an unproven command word escalates instead of being guessed.
+ */
+function commandWord(tokens: readonly string[]): { readonly name: string; readonly argsStart: number } | undefined {
+  let index = 0
+  while (index < tokens.length) {
+    const token: string | undefined = tokens[index]
+    if (token === undefined) break
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(token)) {
+      index += 1
+      continue
+    }
+    if (COMMAND_WRAPPERS.has(token.toLowerCase())) {
+      index += 1
+      continue
+    }
+    break
+  }
+  const token: string | undefined = tokens[index]
+  if (token === undefined) return undefined
+  return { name: baseName(token), argsStart: index + 1 }
+}
+
+/** Expand one leading `~`; other `~user` forms stay unresolved. */
+function expandHomePath(raw: string): string | undefined {
+  if (raw === '~') return homedir()
+  if (raw.startsWith('~/')) return resolvePath(homedir(), raw.slice(2))
+  if (raw.startsWith('~')) return undefined
+  return raw
+}
+
+/** Resolve one shell path token against the session cwd; `$HOME`/`$PWD` too. */
+function expandTargetToken(token: string, cwd: string): string | undefined {
+  if (token === '') return undefined
+  if (token === '$HOME' || token === '${HOME}') return homedir()
+  if (token.startsWith('$HOME/')) return resolvePath(homedir(), token.slice('$HOME/'.length))
+  if (token.startsWith('${HOME}/')) return resolvePath(homedir(), token.slice('${HOME}/'.length))
+  if (token === '$PWD' || token === '${PWD}') return cwd
+  if (token.startsWith('$PWD/')) return resolvePath(cwd, token.slice('$PWD/'.length))
+  if (token.startsWith('${PWD}/')) return resolvePath(cwd, token.slice('${PWD}/'.length))
+  const expanded = expandHomePath(token)
+  return expanded === undefined ? undefined : resolvePath(cwd, expanded)
+}
+
+/** Whether `candidate` is `target` itself or one of its ancestors. */
+function isSelfOrAncestor(candidate: string, target: string): boolean {
+  const rest = relative(candidate, target)
+  return rest === '' || !isOutsideRelative(rest)
+}
+
+/** Whether a resolved rm target is root, home, the workspace root or an ancestor. */
+function isRootHomeOrWorkspaceAncestor(target: string, cwd: string): boolean {
+  const trimmed = target.replace(/\/+$/u, '')
+  const normalized = trimmed === '' ? '/' : trimmed
+  if (normalized === '/' || normalized === '/*') return true
+  if (normalized === homedir()) return true
+  return isSelfOrAncestor(normalized, cwd) || isSelfOrAncestor(normalized, homedir())
+}
+
+/** Hard floor D1: `rm` with both recursive and force flags on a root target. */
+function matchesRecursiveRootDelete(tokens: readonly string[], cwd: string): boolean {
+  const command = commandWord(tokens)
+  if (command === undefined || command.name.toLowerCase() !== 'rm') return false
+  const args = tokens.slice(command.argsStart)
+  let recursive = false
+  let force = false
+  for (const token of args) {
+    if (token === '--') break
+    const lower = token.toLowerCase()
+    if (lower === '--recursive') recursive = true
+    else if (lower === '--force') force = true
+    else if (/^-[a-z]+$/u.test(lower)) {
+      if (lower.includes('r')) recursive = true
+      if (lower.includes('f')) force = true
+    }
+  }
+  if (!recursive || !force) return false
+  for (const token of args) {
+    if (token.startsWith('-')) continue
+    const target = expandTargetToken(token, cwd)
+    if (target !== undefined && isRootHomeOrWorkspaceAncestor(target, cwd)) return true
+  }
+  return false
+}
+
+/** Whether one token names a system directory or a path inside one. */
+function isSystemPathToken(token: string): boolean {
+  const cleaned = unquoteToken(token)
+  if (!cleaned.startsWith('/')) return false
+  const lower = cleaned.toLowerCase()
+  return SYSTEM_WRITE_PREFIXES.some((prefix) => {
+    const expected = prefix.toLowerCase()
+    return lower === expected || lower.startsWith(`${expected}/`)
+  })
+}
+
+/** Extract an explicit cp/mv/install `-t`/`--target-directory` value. */
+function targetDirectory(args: readonly string[]): string | undefined {
+  for (let index = 0; index < args.length; index += 1) {
+    const token: string | undefined = args[index]
+    if (token === undefined) continue
+    if (token === '-t' || token === '--target-directory') return args[index + 1]
+    if (token.startsWith('--target-directory=')) return token.slice('--target-directory='.length)
+  }
+  return undefined
+}
+
+/** Whether one sed argument requests in-place editing. */
+function isSedInPlaceFlag(token: string): boolean {
+  return token === '--in-place' || token.startsWith('--in-place=') || /^-[^-]*i/u.test(token)
+}
+
+/** Hard floor D3: writes into system directories through explicit write verbs. */
+function matchesSystemWrite(tokens: readonly string[]): boolean {
+  const command = commandWord(tokens)
+  if (command === undefined) return false
+  const name = command.name.toLowerCase()
+  const args = tokens.slice(command.argsStart)
+  switch (name) {
+    case 'tee':
+      return args.filter(token => !token.startsWith('-')).some(isSystemPathToken)
+    case 'cp':
+    case 'mv':
+    case 'install': {
+      const explicit = targetDirectory(args)
+      if (explicit !== undefined) return isSystemPathToken(explicit)
+      const destination = [...args].reverse().find(token => !token.startsWith('-'))
+      return destination !== undefined && isSystemPathToken(destination)
+    }
+    case 'sed': {
+      if (!args.some(isSedInPlaceFlag)) return false
+      return args.some(token => !token.startsWith('-') && isSystemPathToken(token))
+    }
+    default:
+      return false
+  }
+}
+
+/** Hard floor D2: device destruction verbs and fork-bomb text. */
+function matchesDeviceDestruction(tokens: readonly string[]): boolean {
+  const command = commandWord(tokens)
+  if (command === undefined) return false
+  const name = command.name.toLowerCase()
+  if (name.startsWith('mkfs') || name === 'wipefs') return true
+  const args = tokens.slice(command.argsStart)
+  if (name === 'dd') return args.some(token => /^of=\/dev\//iu.test(token))
+  if (name === 'shred') return args.some(token => token.startsWith('/dev/'))
+  return false
+}
+
+/** D2 redirection into a raw block device (`> /dev/sd*`, not `/dev/null`). */
+function matchesRedirectionToDevice(command: string): boolean {
+  return />{1,2}\s*["']?\/dev\/(?:sd|hd|vd|nvme|disk|mmcblk|loop|dm-|mapper\/)/iu.test(command)
+}
+
+/** D3 redirection into a system directory. A pure read has no `>` and is not matched. */
+function matchesRedirectionToSystemDir(command: string): boolean {
+  const pattern = /(?:^|[^<])>{1,2}\s*([^\s;&|<>]+)/gu
+  for (const match of command.matchAll(pattern)) {
+    const target: string | undefined = match[1]
+    if (target !== undefined && isSystemPathToken(target)) return true
+  }
+  return false
+}
+
+/** Hard floor D5: Git history rewrite commands. `git reset --hard` is E10, not D5. */
+function matchesGitHistoryRewrite(tokens: readonly string[]): boolean {
+  const command = commandWord(tokens)
+  if (command === undefined || command.name.toLowerCase() !== 'git') return false
+  const args = tokens.slice(command.argsStart).map(token => token.toLowerCase())
+  if (args.includes('filter-branch')) return true
+  if (args.includes('reflog') && args.includes('expire')
+    && args.includes('--expire=now') && args.includes('--all')) return true
+  if (args.includes('gc') && args.includes('--prune=now')) return true
+  return false
+}
+
+/**
+ * Match one bash command against the deterministic deny hard floor.
+ * @returns the matching deny rule id, or `undefined` when the command merely
+ * escalates (Phase 1 never allows a shell command).
+ */
+function matchDenyRule(command: string, cwd: string): string | undefined {
+  if (command.replace(/\s+/gu, '').includes(':(){:|:&};:')) return RULE_D2_DEVICE_DESTRUCTION
+  const unquoted = maskQuoted(command)
+  if (matchesRedirectionToDevice(unquoted)) return RULE_D2_DEVICE_DESTRUCTION
+  if (matchesRedirectionToSystemDir(unquoted)) return RULE_D3_SYSTEM_DIRECTORY_WRITE
+  for (const tokens of shellSegments(command)) {
+    if (matchesRecursiveRootDelete(tokens, cwd)) return RULE_D1_RECURSIVE_ROOT_DELETE
+    if (matchesDeviceDestruction(tokens)) return RULE_D2_DEVICE_DESTRUCTION
+    if (matchesSystemWrite(tokens)) return RULE_D3_SYSTEM_DIRECTORY_WRITE
+    if (matchesGitHistoryRewrite(tokens)) return RULE_D5_GIT_HISTORY_REWRITE
+  }
+  return undefined
+}
+
+/** Normalize a relative path to POSIX separators for records and denylists. */
+function toPosix(pathValue: string): string {
+  return sep === '/' ? pathValue : pathValue.split(sep).join('/')
+}
+
+/** Whether a `..`-relative value escapes its base (segment-aware, not prefix-aware). */
+function isOutsideRelative(value: string): boolean {
+  return value === '..' || value.startsWith(`..${sep}`) || isAbsolute(value)
+}
+
+/**
+ * Credential-shaped and agent/VCS-configuration path denylist for allow rules.
+ * Returns true when the path may not be allowed, so the caller escalates.
+ */
+function isSensitiveWorkspacePath(pathValue: string): boolean {
+  const segments = pathValue.toLowerCase().split('/').filter(segment => segment !== '' && segment !== '.')
+  if (segments.length === 0) return false
+  const base = segments.at(-1) ?? ''
+  if (base.startsWith('.env')) return true
+  if (segments.includes('.ssh')) return true
+  if (base.startsWith('id_rsa') || base.startsWith('id_ed25519')) return true
+  if (base.endsWith('.pem') || base.endsWith('.key')) return true
+  if (base.startsWith('credentials')) return true
+  if (segments.includes('.aws')) return true
+  if (base === '.npmrc' || base === '.git-credentials' || base === '.netrc') return true
+  if (segments.some((segment, index) => segment === '.git' && segments[index + 1] === 'config')) return true
+  if (segments.some(segment => segment.startsWith('.dsh'))) return true
+  if (segments.includes('.agent-teams')) return true
+  if (base === 'cordis.patch.yml' || base === 'settings.yaml' || base === '.credentials.yaml') return true
+  return false
+}
+
+/** One path argument proven to resolve inside the session workspace. */
+interface ResolvedWorkspacePath {
+  /** Workspace-relative path after symlink resolution (record/denylist value). */
+  readonly realRelative: string
+  /** Workspace-relative path before symlink resolution, for denylist aliases. */
+  readonly lexicalRelative: string
+}
+
+/**
+ * Resolve one read/grep/glob path argument inside the session workspace.
+ *
+ * A missing target, an unresolvable symlink, or any realpath failure returns
+ * `undefined` so the caller escalates: an uncertain path is never allowed.
+ *
+ * @param cwd - the session working directory (the workspace boundary).
+ * @param raw - the raw path argument (`~` allowed, relative to `cwd`).
+ * @returns both resolved relative forms, or `undefined` when not provable.
+ */
+function resolveWorkspacePath(cwd: string, raw: string): ResolvedWorkspacePath | undefined {
+  if (raw.length === 0 || raw.includes('\0')) return undefined
+  const expanded = expandHomePath(raw)
+  if (expanded === undefined) return undefined
+  const absolute = resolvePath(cwd, expanded)
+  let realWorkspace: string
+  let realTarget: string
+  try {
+    realWorkspace = realpathSync.native(cwd)
+    realTarget = realpathSync.native(absolute)
+  } catch {
+    // A missing target or an unresolvable link is ambiguous: never allow it.
+    return undefined
+  }
+  const realRelative = relative(realWorkspace, realTarget)
+  if (isOutsideRelative(realRelative)) return undefined
+  const lexicalRelative = relative(resolvePath(cwd), absolute)
+  return {
+    realRelative: toPosix(realRelative === '' ? '.' : realRelative),
+    lexicalRelative: toPosix(lexicalRelative === '' ? '.' : lexicalRelative),
+  }
+}
+
+/** One deterministic rule-gate verdict. */
+interface RuleGateVerdict {
+  readonly tier: RuleGateTier
+  readonly rule: string
+  /** Workspace-relative path for a path rule; `null` for shell/meta calls. */
+  readonly cwdRelative: string | null
+}
+
+/** One evaluation plus the session cwd, used only to resolve a relative log path. */
+interface RuleGateEvaluation {
+  readonly verdict: RuleGateVerdict
+  readonly cwd: string | undefined
+}
+
+/** Materialize one deterministic evaluation. */
+function ruleGateVerdict(
+  tier: RuleGateTier,
+  rule: string,
+  cwdRelative: string | null,
+  cwd: string | undefined,
+): RuleGateEvaluation {
+  return { verdict: { tier, rule, cwdRelative }, cwd }
+}
+
+/** Fail-closed evaluation: the reviewer decides. */
+function ruleGateEscalate(cwd: string | undefined): RuleGateEvaluation {
+  return ruleGateVerdict('escalate', RULE_E_ESCALATE, null, cwd)
+}
+
+/**
+ * Evaluate the Phase 1 deterministic rules for one pending call.
+ *
+ * Unknown tools, missing or ill-typed arguments, out-of-workspace or symlinked
+ * paths, and every shell command that does not match the deny hard floor
+ * escalate to the reviewer. No rule can throw for malformed input; filesystem
+ * ambiguity is converted to `undefined` by {@link resolveWorkspacePath}.
+ *
+ * @param ctx - composed harness context owning the working-directory seam.
+ * @param agent - the reviewed call's agent (supplies the session workspace).
+ * @param exec - immutable pending execution.
+ * @param signal - call lifetime fused with the integration lifecycle.
+ * @returns the deterministic verdict for this call.
+ */
+async function evaluateRuleGate(
+  ctx: Context,
+  agent: Agent,
+  exec: ToolExecution,
+  signal: AbortSignal,
+): Promise<RuleGateEvaluation> {
+  if (typeof exec.name !== 'string' || exec.name.length === 0) return ruleGateEscalate(undefined)
+  if (!isRecord(exec.arguments)) return ruleGateEscalate(undefined)
+  const cwd = await ctx.workingDirectory.ensure(agent, signal)
+  if (typeof cwd !== 'string' || !isAbsolute(cwd)) return ruleGateEscalate(undefined)
+  if (exec.name === 'bash') {
+    const command = exec.arguments['command']
+    if (typeof command !== 'string') return ruleGateEscalate(cwd)
+    const denyRule = matchDenyRule(command, cwd)
+    return denyRule === undefined
+      ? ruleGateEscalate(cwd)
+      : ruleGateVerdict('deny', denyRule, null, cwd)
+  }
+  if (RULE_GATE_META_TOOLS.has(exec.name)) {
+    return ruleGateVerdict('allow', RULE_A04_META_READ, null, cwd)
+  }
+  if (exec.name === 'read') {
+    const rawPath = exec.arguments['file_path']
+    if (typeof rawPath !== 'string' || rawPath.length === 0) return ruleGateEscalate(cwd)
+    return evaluateReadPath(cwd, rawPath)
+  }
+  if (exec.name === 'grep' || exec.name === 'glob') {
+    const rawPath = exec.arguments['path']
+    if (rawPath === undefined) {
+      // An absent path means the session cwd itself; prove it resolves.
+      if (resolveWorkspacePath(cwd, '.') === undefined) return ruleGateEscalate(cwd)
+      return ruleGateVerdict('allow', RULE_A02_READONLY_SEARCH, '.', cwd)
+    }
+    if (typeof rawPath !== 'string' || rawPath.length === 0) return ruleGateEscalate(cwd)
+    return evaluateSearchPath(cwd, rawPath)
+  }
+  return ruleGateEscalate(cwd)
+}
+
+/** Apply the read allow rule to one path argument. */
+function evaluateReadPath(cwd: string, rawPath: string): RuleGateEvaluation {
+  const resolved = resolveWorkspacePath(cwd, rawPath)
+  if (resolved === undefined || isSensitiveWorkspacePath(resolved.realRelative)) return ruleGateEscalate(cwd)
+  if (!isOutsideRelative(resolved.lexicalRelative) && isSensitiveWorkspacePath(resolved.lexicalRelative)) {
+    return ruleGateEscalate(cwd)
+  }
+  return ruleGateVerdict('allow', RULE_A01_READONLY_READ, resolved.realRelative, cwd)
+}
+
+/** Apply the grep/glob allow rule to one path argument. */
+function evaluateSearchPath(cwd: string, rawPath: string): RuleGateEvaluation {
+  const resolved = resolveWorkspacePath(cwd, rawPath)
+  if (resolved === undefined || isSensitiveWorkspacePath(resolved.realRelative)) return ruleGateEscalate(cwd)
+  if (!isOutsideRelative(resolved.lexicalRelative) && isSensitiveWorkspacePath(resolved.lexicalRelative)) {
+    return ruleGateEscalate(cwd)
+  }
+  return ruleGateVerdict('allow', RULE_A02_READONLY_SEARCH, resolved.realRelative, cwd)
+}
+
+/** One shadow/enforce JSONL decision record. Deliberately excludes arguments. */
+interface RuleGateRecord {
+  readonly ts: string
+  readonly mode: Exclude<RuleGateMode, 'off'>
+  readonly tier: RuleGateTier
+  readonly rule: string
+  readonly tool: string
+  readonly sessionIdHash: string
+  readonly argLength: number
+  readonly cwdRelative: string | null
+}
+
+/** Hash one session id with sha256 and keep its first 12 hex characters. */
+function ruleGateSessionIdHash(agent: Agent): string {
+  const id: unknown = agent.session.id
+  return createHash('sha256').update(typeof id === 'string' ? id : String(id)).digest('hex').slice(0, 12)
+}
+
+/** Length of the compact JSON argument text; record-only, never raises. */
+function ruleGateArgumentLength(args: unknown): number {
+  try {
+    const serialized = JSON.stringify(args)
+    return typeof serialized === 'string' ? serialized.length : 0
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Append one private decision record for a shadow/enforce call.
+ *
+ * A record carries no tool arguments, file contents or raw session id. The
+ * directory is created with mode 0700 and the file with mode 0600. Any failure
+ * is the caller's to swallow: a lost record must never change a decision.
+ */
+function writeRuleGateRecord(
+  config: AutoReviewConfig,
+  mode: Exclude<RuleGateMode, 'off'>,
+  verdict: RuleGateVerdict,
+  exec: ToolExecution,
+  agent: Agent,
+  cwd: string | undefined,
+): void {
+  const configuredLog = readConfigValue(config.ruleGateLog)
+  const configured = typeof configuredLog === 'string' && configuredLog.trim() !== ''
+    ? configuredLog
+    : DEFAULT_RULE_GATE_LOG
+  const expanded = expandHomePath(configured)
+  if (expanded === undefined || expanded.trim() === '') {
+    throw new Error(`auto-review: ruleGateLog is not a usable path: ${configured}`)
+  }
+  const logPath = isAbsolute(expanded) || cwd === undefined ? expanded : resolvePath(cwd, expanded)
+  const record: RuleGateRecord = {
+    ts: new Date().toISOString(),
+    mode,
+    tier: verdict.tier,
+    rule: verdict.rule,
+    tool: exec.name,
+    sessionIdHash: ruleGateSessionIdHash(agent),
+    argLength: ruleGateArgumentLength(exec.arguments),
+    cwdRelative: verdict.cwdRelative,
+  }
+  mkdirSync(dirname(logPath), { recursive: true, mode: 0o700 })
+  appendFileSync(logPath, `${JSON.stringify(record)}\n`, { mode: 0o600 })
+}
+
+/**
+ * Evaluate one call and write its shadow/enforce record.
+ *
+ * The rule engine is fail-closed: any thrown defect logs and escalates to the
+ * reviewer instead of failing the tool call. Record writing is observational
+ * and caught separately for the same reason.
+ *
+ * @returns the deterministic verdict used by the listener.
+ */
+async function applyRuleGate(
+  ctx: Context,
+  agent: Agent,
+  exec: ToolExecution,
+  signal: AbortSignal,
+  config: AutoReviewConfig,
+  mode: Exclude<RuleGateMode, 'off'>,
+): Promise<RuleGateEvaluation> {
+  let evaluation: RuleGateEvaluation
+  try {
+    evaluation = await evaluateRuleGate(ctx, agent, exec, signal)
+  } catch (error) {
+    // Fail closed: a rule-engine defect must fall through to the reviewer,
+    // never fail the tool call or fabricate an allow.
+    console.warn(`auto-review: rule gate failed; falling through to the reviewer: ${errorText(error)}`)
+    evaluation = ruleGateEscalate(undefined)
+  }
+  try {
+    writeRuleGateRecord(config, mode, evaluation.verdict, exec, agent, evaluation.cwd)
+  } catch (error) {
+    // A decision record is observational only; losing it must not change the call.
+    console.warn(`auto-review: rule gate decision record was not written: ${errorText(error)}`)
+  }
+  return evaluation
+}
+
+/** Materialize one deterministic rule-gate denial with its own error identity. */
+function ruleDenied(exec: ToolExecution, verdict: RuleGateVerdict): PreToolDecision {
+  return {
+    kind: 'deny',
+    reason: `Auto review rule gate denied tool "${exec.name}" (${verdict.rule}); its body was not executed`,
+    info: { name: AUTO_REVIEW_RULE_DENIED_ERROR_NAME, code: AUTO_REVIEW_RULE_DENIED_CODE },
+  }
+}
+
 /** Install the Auto preset and its review gate; preserve Session selection on application shutdown. */
 export function apply(ctx: Context, config: AutoReviewConfig = {}): void {
   // Retain the injected service while this context drains on disposal.
@@ -1154,6 +1858,24 @@ export function apply(ctx: Context, config: AutoReviewConfig = {}): void {
       active.add(completed.promise)
       try {
         const signal = AbortSignal.any([exec.signal, lifecycle.signal])
+        // Phase 1 deterministic gate: only shadow/enforce read it, and `off`
+        // (the default) keeps today's reviewer-only pipeline exactly as it was.
+        const ruleGateMode = resolveRuleGateMode(readConfigValue(config.ruleGate))
+        if (ruleGateMode !== 'off') {
+          const ruleGate = await applyRuleGate(ctx, agent, exec, signal, config, ruleGateMode)
+          if (isAborted(lifecycle.signal)) return { kind: 'cancel' }
+          // An allow skips only the reviewer: `next()` keeps every downstream
+          // gate, guard and side effect of the existing pipeline identical.
+          if (ruleGateMode === 'enforce' && ruleGate.verdict.tier === 'allow') {
+            const downstream = await next()
+            if (isAborted(lifecycle.signal)) return { kind: 'cancel' }
+            return downstream
+          }
+          if (ruleGateMode === 'enforce' && ruleGate.verdict.tier === 'deny') {
+            return ruleDenied(exec, ruleGate.verdict)
+          }
+          // Shadow, and every enforce escalate, fall through to the reviewer.
+        }
         let shown = shownBySession.get(agent.session)
         if (shown === undefined) {
           shown = new Map()

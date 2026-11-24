@@ -37,6 +37,10 @@ class Schema {
 }
 
 const z = {
+  /** Build one string schema. */
+  string() {
+    return new Schema('string', {})
+  },
   /** Build one number schema. */
   number() {
     return new Schema('number', {})
